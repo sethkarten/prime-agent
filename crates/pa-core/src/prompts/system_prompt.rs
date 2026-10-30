@@ -307,7 +307,7 @@ fn session_role_section(options: &BuildSystemPromptOptions, has_ipython: bool) -
     }
     if has_ipython {
         lines.push(
-            "`await bash(cmd)` waits at most `yield_after` seconds (`bash(cmd, yield_after=...)`, default 10, max 300; `None` uses the default, not an unbounded wait). If the command is still running, it returns a snapshot: `r.running` is True, `r.exit_code` is None, `r.output` is the output so far, and `r.handle` is the live handle. A completed result has `r.running` False and an integer `r.exit_code`. The command keeps running after a snapshot; end the turn and collect the final result on the `[bash-done]` notification."
+            "`await bash(cmd)` waits at most the 10-second auto-background promotion window (`bash(cmd, yield_after=...)` requests above the window are clamped to it; `None` uses the window, not an unbounded wait). If the command is still running, it returns a snapshot: `r.running` is True, `r.exit_code` is None, `r.output` is the output so far, and `r.handle` is the live handle. A completed result has `r.running` False and an integer `r.exit_code`. The command is auto-promoted to background at the window: end the turn right after the snapshot — never `time.sleep`, never poll, never keep working in that cell — and the `[bash-done]` notification wakes the session with the final result. A later `await` of a promoted handle waits only a second or two to collect the result."
                 .to_string(),
         );
     } else {

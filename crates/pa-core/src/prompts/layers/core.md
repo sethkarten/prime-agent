@@ -16,7 +16,7 @@ The harness often sends messages to the agent. These are user messages starting 
     - `.output() -> str`
     - `.poll() -> BashResult | None`
     - `.kill(sig: int = SIGTERM, grace: float = 5.0) -> None`: SIGTERM, escalating to SIGKILL; on Windows kill() uses taskkill /T and detached or reparented descendants may survive
-    - `await handle`: waits according to this session's bash completion contract; the handle remains awaitable after command completion
+    - `await handle`: waits at most the session's 10-second auto-background promotion window — a command still running past it is auto-promoted to background, the await returns a snapshot, and the turn should end so the `[bash-done]` notification can wake the session; a later await of a promoted handle waits only a short collect bound; the handle remains awaitable after command completion
   - `BashResult`
     - `.exit_code: int`
     - `.output: str`

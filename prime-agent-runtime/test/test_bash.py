@@ -1390,10 +1390,11 @@ class BoundedAwaitTest(unittest.IsolatedAsyncioTestCase):
         bash_module._degrade_hints_written = 0
         self.addCleanup(setattr, bash_module, "_degrade_hints_written", 0)
 
-    async def test_wired_default_and_maximum_bounds(self):
+    async def test_wired_bounds_clamp_to_the_promotion_window(self):
         self._wire_notices()
         self.assertEqual(bash_module._effective_yield_after(None), 10.0)
-        self.assertEqual(bash_module._effective_yield_after(500), 300.0)
+        self.assertEqual(bash_module._effective_yield_after(500), 10.0)
+        self.assertEqual(bash_module._effective_yield_after(25), 10.0)
         self.assertEqual(bash_module._effective_yield_after(0.25), 0.25)
         bash_module._set_completion_notices_wired(False)
         self.assertIsNone(bash_module._effective_yield_after(None))
@@ -1437,19 +1438,48 @@ class BoundedAwaitTest(unittest.IsolatedAsyncioTestCase):
         snapshot = await handle
         self.assertIsInstance(snapshot, bash_module.BashSnapshot)
 
+        # The promote path: a re-awaired handle waits only the short collect
+        # bound, so a cancel racing it lands on a completed snapshot or a
+        # cancelled await — either way the command survives.
         async def consume():
             return await handle
 
         task = asyncio.create_task(consume())
         await asyncio.sleep(0.2)
         task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
+        try:
+            snapshot = await task
+            self.assertIsInstance(snapshot, bash_module.BashSnapshot)
+        except asyncio.CancelledError:
+            pass
         # The degrade released the handle: a cancelled later await stops
         # waiting without killing the still-running command.
         self.assertTrue(handle.running)
         result = await asyncio.wait_for(handle._wait(), 10)
         self.assertEqual(result.exit_code, 0)
+
+    async def test_promoted_handle_reawait_waits_only_the_short_bound(self):
+        self._wire_notices()
+        handle = bash("sleep 3", yield_after=0.3)
+        self.assertIsInstance(await handle, bash_module.BashSnapshot)
+        self.assertTrue(handle._promoted)
+        # A re-await of a still-running promoted handle degrades at the
+        # short collect bound (2s), never the full promotion window.
+        start = time.monotonic()
+        again = await handle
+        elapsed = time.monotonic() - start
+        self.assertIsInstance(again, bash_module.BashSnapshot)
+        self.assertTrue(again.running)
+        self.assertLess(elapsed, 3.0)
+        result = await asyncio.wait_for(handle._wait(), 10)
+        self.assertEqual(result.exit_code, 0)
+        # Once finished, a later await collects the completed result inside
+        # the short bound.
+        start = time.monotonic()
+        final = await handle
+        self.assertFalse(final.running)
+        self.assertEqual(final.exit_code, 0)
+        self.assertLess(time.monotonic() - start, 2.0)
 
     async def test_degrade_hints_are_budgeted_to_the_first_three(self):
         self._wire_notices()

@@ -64,7 +64,17 @@ _ASYNCIO_WRAPPER_CALLBACKS = {
 # of truth; the numbers stay here, never on the Rust side.
 _completion_notices_wired = False
 _DEFAULT_YIELD_AFTER_SECONDS = 10.0
-_MAX_YIELD_AFTER_SECONDS = 300.0
+# The auto-background promotion window: the ceiling every inline await of a
+# handle is clamped to. A command still running past the window is
+# auto-promoted to background — the await degrades to a snapshot, and the
+# [bash-done] notification delivers the final result — so no inline await
+# can hold a turn longer than the window.
+_PROMOTION_WINDOW_SECONDS = 10.0
+# A re-await of a promoted handle waits only this long: enough to collect a
+# command that finished (its wait resolves in milliseconds once the reaper
+# ran) and to observe a just-killed shell, while staying an order of
+# magnitude under the window so no cell can re-charge a hold on it.
+_PROMOTED_REAWAIT_SECONDS = 2.0
 
 
 def _set_completion_notices_wired(wired: bool) -> None:
@@ -79,12 +89,16 @@ def _set_completion_notices_wired(wired: bool) -> None:
 
 
 def _effective_yield_after(yield_after: float | None) -> float | None:
-    """The bound every await of a handle uses; None means unbounded."""
+    """The bound every await of a handle uses; None means unbounded.
+
+    Every bound is clamped to the promotion window: an explicit
+    `yield_after` above it cannot extend an inline hold past the window.
+    """
     if not _completion_notices_wired:
         return None
     if yield_after is None:
         return _DEFAULT_YIELD_AFTER_SECONDS
-    return min(yield_after, _MAX_YIELD_AFTER_SECONDS)
+    return min(yield_after, _PROMOTION_WINDOW_SECONDS)
 
 
 # One stderr hint per degrade, budgeted per kernel (nano-rlm's
@@ -103,8 +117,11 @@ def _note_degrade(handle: "BashHandle", bound: float) -> None:
     sys.stderr.write(
         f"bash: still running after {bound:g}s (pid {handle._pid}); "
         "returned a snapshot: r.running is True, r.output is the output so "
-        "far, r.handle is the live handle. End the turn — a [bash-done] "
-        "notification arrives when it finishes.\n"
+        "far, r.handle is the live handle. The command is auto-promoted to "
+        "background: end this turn now — the [bash-done] notification "
+        "arrives with the final result, and a later await collects it as "
+        "soon as it finishes. Do not sleep, poll, or run other work in this "
+        "cell.\n"
     )
 
 
@@ -378,6 +395,11 @@ class BashHandle:
     .output()/.tail()/.poll()/.kill() first marks the handle as a background
     handle; later awaits only wait and cancelling them leaves it running.
     """
+
+    # Set once an await degraded: the command was auto-promoted to background
+    # past the promotion window. Later awaits of a promoted handle wait only
+    # the short collect bound instead of re-charging the full window.
+    _promoted = False
 
     def __init__(self, command: str, yield_after: float | None = None) -> None:
         self.command = command
@@ -1071,6 +1093,11 @@ class BashHandle:
             current_task = None
         creating_cell_waited = _creating_cell_waits_for(self._creating_cell_task, current_task)
         bound = _effective_yield_after(self._yield_after)
+        if self._promoted and bound is not None:
+            # Auto-backgrounded past the promotion window once: a re-await
+            # waits only the short collect bound, never the full window, so
+            # no cell can re-charge a turn-hold on this handle.
+            bound = _PROMOTED_REAWAIT_SECONDS
         owned = not self._released
         wait = self._wait_owned() if owned else self._wait()
         self._released = True
@@ -1080,6 +1107,9 @@ class BashHandle:
             result = yield from _bounded_wait(wait, bound).__await__()
             if result is None:
                 degraded = True
+                # The window elapsed with the command live: auto-promote it
+                # to background so later awaits never re-charge the window.
+                self._promoted = True
             else:
                 completed = True
         finally:
@@ -1321,7 +1351,12 @@ def bash(command: str, yield_after: float | None = None, persistent: bool = Fals
     handle) while the command keeps running, and its [bash-done] notification
     arrives on completion. `yield_after=None` uses the session
     default (10 seconds); explicit values must be positive and are clamped to
-    300. In sessions without completion notices every await stays unbounded and
+    the 10-second auto-background promotion window — a command still running
+    past the window is auto-promoted to background, a later await of the same
+    handle waits only a short collect bound (the completed result when it
+    finished, a fresh snapshot while it runs), and the turn should end so the
+    [bash-done] notification can wake the session. In sessions
+    without completion notices every await stays unbounded and
     `yield_after` has no effect. `h = bash(cmd)` used as a background
     handle (any .pid/.running/.output()/.tail()/.poll()/.kill() access before
     the first await) survives cancellation; awaiting it only waits. Leak
