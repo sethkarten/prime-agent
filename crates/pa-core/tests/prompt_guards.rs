@@ -585,6 +585,44 @@ fn bounded_await_contract_renders_in_daemon_and_daemonless_sessions() {
     }
 }
 
+/// The turn-ending contract renders wherever the Python REPL does, in both
+/// wake modes: the loop model, the full wake list, and the in-turn wait
+/// prohibition sit at the prompt's terminal recency (the session-role
+/// segment). The daemonless wake list must drop the heartbeat, which its own
+/// line says never fires without a daemon.
+#[test]
+fn turn_end_contract_renders_in_daemon_and_daemonless_sessions() {
+    let mut options = BuildSystemPromptOptions {
+        cwd: "/w".to_string(),
+        messages_path: Some("/log.jsonl".to_string()),
+        skills: sorted_bundled_skills(),
+        selected_tools: Some(vec!["python_repl"]),
+        ..Default::default()
+    };
+    for daemonless in [false, true] {
+        options.daemonless = daemonless;
+        let prompt = system_prompt_breakdown(&options).assembled;
+        assert!(
+            prompt.contains("Multi-step work spans many short turns")
+                && prompt.contains("[agent-message from child:<name>]")
+                && prompt.contains("Never wait inside the turn")
+                && prompt.contains("one short line of text is a complete turn"),
+            "daemonless={daemonless}: the prompt must carry the turn-ending contract: {prompt}"
+        );
+        if daemonless {
+            assert!(
+                !prompt.contains("a heartbeat on its schedule"),
+                "the daemonless wake list must not promise heartbeat wakes"
+            );
+        } else {
+            assert!(
+                prompt.contains("a heartbeat on its schedule"),
+                "the daemon wake list must carry the heartbeat wake"
+            );
+        }
+    }
+}
+
 /// The generic mcp skill loads through the normal markdown discovery and renders in the
 /// `<available_skills>` inventory exactly like any other markdown skill: the `[skill name
 /// location]`-style XML the TS `formatSkillsForPrompt` emits, without a `python_import` line.

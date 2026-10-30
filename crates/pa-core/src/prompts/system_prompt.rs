@@ -310,6 +310,24 @@ fn session_role_section(options: &BuildSystemPromptOptions, has_ipython: bool) -
             "`await bash(cmd)` waits at most `yield_after` seconds (`bash(cmd, yield_after=...)`, default 10, max 300; `None` uses the default, not an unbounded wait). If the command is still running, it returns a snapshot: `r.running` is True, `r.exit_code` is None, `r.output` is the output so far, and `r.handle` is the live handle. A completed result has `r.running` False and an integer `r.exit_code`. The command keeps running after a snapshot; end the turn and collect the final result on the `[bash-done]` notification."
                 .to_string(),
         );
+        // The turn-ending contract, at the prompt's terminal recency: the
+        // loop model (many short turns, one wake each) and the wake guarantee
+        // that makes ending a turn safe. The prohibition restates the usage
+        // layer's no-polling rule where the turn's end is decided. The
+        // daemonless wake list drops the heartbeat (its line above already
+        // says heartbeats never fire without a daemon).
+        let heartbeat_wake = if options.daemonless {
+            ""
+        } else {
+            "a heartbeat on its schedule, "
+        };
+        lines.push(format!(
+            "Multi-step work spans many short turns: while background work runs, end the turn with a one-line status and stop. Ending a turn parks the session, nothing is lost. Every event wakes it: a finished `bash()` command as its `[bash-done pid:N exit:M]` notification, a subagent's reply as its `[agent-message from child:<name>]` message, {heartbeat_wake}and each new user message on arrival; the wake continues the task with the result in hand."
+        ));
+        lines.push(
+            "Never wait inside the turn: `time.sleep()`/`asyncio.sleep()`, repeated `.poll()`/`.output()`/`agent_observe`/`rlm.collect` snapshot loops, and re-awaiting a running handle to make it finish hold the turn for wall time the wake would deliver for free. A turn ends with a text reply, never a placeholder cell; one short line of text is a complete turn."
+                .to_string(),
+        );
     } else {
         lines.push(
             "This session has no Python REPL (`python_repl` tool): the programmatic tools described above are unavailable here."
