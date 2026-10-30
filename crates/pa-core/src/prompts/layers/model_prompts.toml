@@ -6,4 +6,4 @@
 
 [[rule]]
 match = ["glm-5.3*"]
-files = ["bash-over-subprocess.md"]
+files = ["bash-over-subprocess.md", "large-team-orchestration.md"]

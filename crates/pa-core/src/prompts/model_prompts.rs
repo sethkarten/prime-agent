@@ -11,10 +11,16 @@ use serde::Deserialize;
 
 pub const MODEL_PROMPTS_TOML: &str = include_str!("layers/model_prompts.toml");
 
-const MODEL_PROMPT_FILES: &[(&str, &str)] = &[(
-    "bash-over-subprocess.md",
-    include_str!("layers/bash-over-subprocess.md"),
-)];
+const MODEL_PROMPT_FILES: &[(&str, &str)] = &[
+    (
+        "bash-over-subprocess.md",
+        include_str!("layers/bash-over-subprocess.md"),
+    ),
+    (
+        "large-team-orchestration.md",
+        include_str!("layers/large-team-orchestration.md"),
+    ),
+];
 
 const USER_MODEL_PROMPTS_TOML: &str = "model-prompts.toml";
 
@@ -471,17 +477,20 @@ files = ["shared.md", "user-only.md"]
     }
 
     #[test]
-    fn shipped_glm_bash_rule_applies_to_glm_models_only() {
+    fn shipped_glm_rule_applies_to_glm_models_only() {
         let empty = tempfile::tempdir().unwrap();
         let resolution =
             load_model_prompts(Some("prime-inference/internal/glm-5.3-fast"), empty.path());
         assert!(resolution.errors.is_empty(), "{:#?}", resolution.errors);
-        let expected = MODEL_PROMPT_FILES
+        let expected: Vec<&str> = MODEL_PROMPT_FILES
             .iter()
-            .find(|(name, _)| *name == "bash-over-subprocess.md")
-            .map(|(_, content)| (*content).trim())
-            .expect("the shipped file table names bash-over-subprocess.md");
-        assert_eq!(resolution.extras.as_deref(), Some(expected));
+            .map(|(_, content)| content.trim())
+            .collect();
+        assert_eq!(
+            resolution.extras.as_deref(),
+            Some(expected.join("\n\n").as_str()),
+            "the shipped glm rule carries every shipped file, joined in rule order"
+        );
 
         let other = load_model_prompts(Some("anthropic/claude-sonnet-4"), empty.path());
         assert_eq!(other, ModelPromptResolution::default());
