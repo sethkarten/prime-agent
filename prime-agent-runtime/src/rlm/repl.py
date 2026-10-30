@@ -33,6 +33,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from . import factory as factory_module
+from . import bash as _bash_module
 from .bash import _kill_live_handles, _rehydrate_persistent_shells
 
 PROTOCOL_VERSION = 3
@@ -93,6 +94,58 @@ _pending_host: dict[str, "asyncio.Future[dict[str, Any]]"] = {}
 # Set on the loop thread once stdin hits EOF or a shutdown request arrives; no
 # host reply can arrive after that, so waiting (and future) host_request calls fail.
 _host_closed = False
+
+
+# The kernel's wait line: cell code never parks the turn waiting. Where the
+# host wires completion notices (the same gate that bounds `await bash()`),
+# sleeps issued by cell code are charged to a per-cell budget, and a sleep
+# that would reach the line raises SleepRefusedError instead of running —
+# the sanctioned wait is ending the turn and waking on the `[bash-done]`
+# notification, a subagent reply, or a heartbeat. Sleeps called by runtime
+# or library code keep running (the guard keys on the caller's frame being
+# cell code, `<cell-N>`), and a bare kernel without the wake machinery keeps
+# plain sleeps.
+_SLEEP_WAIT_LINE_S = 5.0
+_cell_sleep_budget: dict[str, float] = {}
+
+
+class SleepRefusedError(RuntimeError):
+    """A cell-side sleep would reach the per-cell wait line."""
+
+
+def _refusal_message(spent: float, requested: float) -> str:
+    return (
+        f"the kernel does not wait in a cell: this cell already slept {spent:g}s and "
+        f"sleep({requested:g}s) would reach the {_SLEEP_WAIT_LINE_S:g}s wait line. "
+        "End the turn — the [bash-done] notification, subagent replies, and "
+        "heartbeats arrive as new messages and wake the session "
+        "(rlm_heartbeat.create schedules a wake)."
+    )
+
+
+def _guard_sleep(sleep_fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap time.sleep/asyncio.sleep with the cell-side wait line."""
+
+    @functools.wraps(sleep_fn)
+    def guarded(seconds: float, *args: Any, **kwargs: Any) -> Any:
+        if _bash_module._completion_notices_wired:
+            caller = sys._getframe(1)
+            cell = caller.f_code.co_filename if caller is not None else ""
+            if cell.startswith("<cell-"):
+                spent = _cell_sleep_budget.get(cell, 0.0)
+                requested = max(float(seconds), 0.0)
+                if spent + requested >= _SLEEP_WAIT_LINE_S:
+                    raise SleepRefusedError(_refusal_message(spent, requested))
+                _cell_sleep_budget[cell] = spent + requested
+        return sleep_fn(seconds, *args, **kwargs)
+
+    return guarded
+
+
+def _install_sleep_guard() -> None:
+    """Wrap the module-level time.sleep and asyncio.sleep once per kernel."""
+    time.sleep = _guard_sleep(time.sleep)
+    asyncio.sleep = _guard_sleep(asyncio.sleep)
 
 # In-flight dedicated-lane MCP status requests (the eager settle and the
 # connections view ride this lane): the serve loop hands them off instead of
@@ -1766,6 +1819,7 @@ def main() -> None:
 
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)
+    _install_sleep_guard()
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     signal.signal(signal.SIGINT, _sigint_handler)
     threading.Thread(target=_read_requests, args=(stdin_fd, queue), daemon=True).start()

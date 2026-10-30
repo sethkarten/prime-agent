@@ -645,3 +645,32 @@ fn usage_layer_ends_turns_on_the_done_notification_not_an_await_rule() {
         "the no-polling rule keeps the collect-on-notice turn-end contract"
     );
 }
+
+/// The cell sleep wait line renders wherever the Python REPL does: the kernel
+/// refuses cell-side `time.sleep()`/`asyncio.sleep()` past 5 seconds in total
+/// (SleepRefusedError), and both prompt surfaces — the static usage layer and
+/// the dynamic role section — must teach the sanctioned alternative: end the
+/// turn, the wake arrives as a new message.
+#[test]
+fn sleep_wait_line_contract_renders_in_both_prompt_surfaces() {
+    assert!(
+        USAGE_LAYER.contains("SleepRefusedError")
+            && USAGE_LAYER.contains("end the turn and let the wake"),
+        "the usage layer carries the cell sleep wait line"
+    );
+    let mut options = BuildSystemPromptOptions {
+        cwd: "/w".to_string(),
+        messages_path: Some("/log.jsonl".to_string()),
+        skills: sorted_bundled_skills(),
+        selected_tools: Some(vec!["python_repl"]),
+        ..Default::default()
+    };
+    for daemonless in [false, true] {
+        options.daemonless = daemonless;
+        let prompt = system_prompt_breakdown(&options).assembled;
+        assert!(
+            prompt.contains("SleepRefusedError") && prompt.contains("5 seconds in total"),
+            "daemonless={daemonless}: the role section carries the sleep wait line: {prompt}"
+        );
+    }
+}

@@ -290,6 +290,57 @@ class ReplTest(unittest.TestCase):
         events = self.repl.execute("bg3", "task.cancel()\nimport asyncio\nawait asyncio.sleep(0.05)\nlen(acc)")
         self.assertEqual(one(events, "done")["status"], "ok")
 
+    def test_cell_sleep_past_wait_line_refused_fast(self):
+        """Armed with the completion notice, a cell sleep past the wait line
+        refuses instantly instead of parking the turn — the error teaches the
+        sanctioned end-the-turn wait."""
+        self.repl.execute(
+            "arm", "from rlm.bash import _set_completion_notices_wired\n_set_completion_notices_wired(True)"
+        )
+        started = time.monotonic()
+        events = self.repl.execute("refuse", "import time\ntime.sleep(60)")
+        error = one(events, "error")
+        self.assertIsNotNone(error)
+        self.assertEqual(error["ename"], "SleepRefusedError")
+        self.assertIn("End the turn", error["evalue"])
+        self.assertIn("rlm_heartbeat.create", error["evalue"])
+        self.assertEqual(one(events, "done")["status"], "error")
+        self.assertLess(time.monotonic() - started, 5.0, "refused before any sleeping")
+
+    def test_cell_asyncio_sleep_refused_and_budget_is_cumulative_per_cell(self):
+        self.repl.execute(
+            "arm", "import rlm.repl as _r\n_r._SLEEP_WAIT_LINE_S = 1.0\nfrom rlm.bash import _set_completion_notices_wired\n_set_completion_notices_wired(True)"
+        )
+        started = time.monotonic()
+        events = self.repl.execute("async-refuse", "import asyncio\nawait asyncio.sleep(30)")
+        self.assertEqual(one(events, "error")["ename"], "SleepRefusedError")
+        self.assertLess(time.monotonic() - started, 5.0, "refused before any sleeping")
+        # Two sub-line sleeps in one cell cross the line: the second refuses.
+        events = self.repl.execute("cumulative", "import time\ntime.sleep(0.4)\ntime.sleep(0.4)")
+        error = one(events, "error")
+        self.assertIsNotNone(error)
+        self.assertEqual(error["ename"], "SleepRefusedError")
+        # The budget is per cell: a later cell's sub-line sleep still runs.
+        events = self.repl.execute("fresh-cell", "import time\ntime.sleep(0.4)\n'ran'")
+        self.assertEqual(one(events, "result")["text"], "'ran'")
+
+    def test_sleep_guard_leaves_non_cell_frames_alone(self):
+        """Sleeps whose caller is not cell code (runtime, exec'd helper code,
+        library frames) keep running even while the guard is armed: the guard
+        keys on the caller's frame being a cell."""
+        self.repl.execute(
+            "arm", "import rlm.repl as _r\n_r._SLEEP_WAIT_LINE_S = 1.0\nfrom rlm.bash import _set_completion_notices_wired\n_set_completion_notices_wired(True)"
+        )
+        code = (
+            "exec(compile(\"import time\\ntime.sleep(0.4)\", '<not-a-cell>', 'exec'))\n"
+            "exec(compile(\"import time\\ntime.sleep(0.4)\", '<not-a-cell>', 'exec'))\n"
+            "exec(compile(\"import time\\ntime.sleep(0.4)\", '<not-a-cell>', 'exec'))\n"
+            "'ran'"
+        )
+        events = self.repl.execute("noncell", code)
+        self.assertEqual(one(events, "result")["text"], "'ran'")
+        self.assertEqual(one(events, "done")["status"], "ok")
+
     def test_output_after_done_carries_null_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             trigger = os.path.join(tmp, "go")

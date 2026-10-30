@@ -310,6 +310,10 @@ fn session_role_section(options: &BuildSystemPromptOptions, has_ipython: bool) -
             "`await bash(cmd)` waits at most `yield_after` seconds (`bash(cmd, yield_after=...)`, default 10, max 300; `None` uses the default, not an unbounded wait). If the command is still running, it returns a snapshot: `r.running` is True, `r.exit_code` is None, `r.output` is the output so far, and `r.handle` is the live handle. A completed result has `r.running` False and an integer `r.exit_code`. The command keeps running after a snapshot; end the turn and collect the final result on the `[bash-done]` notification."
                 .to_string(),
         );
+        lines.push(
+            "The kernel never waits out work in a cell: `time.sleep()`/`asyncio.sleep()` raise `SleepRefusedError` once a cell's sleeps would reach 5 seconds in total — end the turn and let the wake (`[bash-done]`, a subagent reply, a heartbeat) arrive as a new message; `rlm_heartbeat.create` schedules one."
+                .to_string(),
+        );
     } else {
         lines.push(
             "This session has no Python REPL (`python_repl` tool): the programmatic tools described above are unavailable here."
