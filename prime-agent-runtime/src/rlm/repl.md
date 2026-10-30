@@ -42,6 +42,16 @@ a time. A malformed line
 produces `{"event":"error","id":null,"ename":"ProtocolError",...}` and the
 runtime keeps serving. Closing stdin is equivalent to `shutdown`.
 
+## Cell contract
+
+The runtime enforces the session's turn-hold contract at the cell boundary: a
+submission whose executed code calls `subprocess`/`os.system`/`os.popen`/`pty.spawn`, or sleeps
+for a literal bound of 5 s or more (`time.sleep`/`asyncio.sleep`), never runs. It fails with a
+`CellContractViolation` whose message carries the recipe instead: dispatch the work through
+`bash()`, end the turn, and let the `[bash-done]` notification deliver the result. The guard
+walks the parsed AST, so a script merely written as text that mentions the banned calls is
+untouched, and sub-5 s pacing is free.
+
 ## Events
 
 - `{"event":"ready","protocol":3,"python":"3.13.11"}` — sent once at startup;

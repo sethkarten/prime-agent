@@ -594,6 +594,100 @@ def _interrupt_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
     return {"event": "error", "id": cell_id, "ename": "KeyboardInterrupt", "evalue": "", "traceback": lines}
 
 
+# ── the cell contract guard (turn-hold discipline) ─────────────────────────
+#
+# The system prompt already forbids holding the turn: no subprocess/os.system
+# in cells, no sleep-polling, dispatch work through bash() and end the turn.
+# The guard enforces that contract at the cell boundary so the violation
+# fails in milliseconds with the recipe, instead of parking the kernel for
+# the whole sleep or hiding a command from the harness. The scan walks the
+# parsed AST: only executed calls are the contract's business, so a script
+# written to disk that mentions subprocess or sleeps is untouched. The
+# sleep line is a literal bound of 5 s or more - the same threshold the
+# session's discipline rubric charges - while sub-5 s pacing stays free.
+
+_SLEEP_LITERAL_FLOOR = 5.0
+_SUBPROCESS_CALLS = frozenset(
+    {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
+)
+
+_SUBPROCESS_MESSAGE = (
+    "subprocess is disabled in this kernel: run commands through the bash() "
+    "tool instead. h = bash('cmd') dispatches without holding the turn - end "
+    "the turn, and the [bash-done] notification delivers the result and wakes "
+    "the session. os.system/os.popen/pty.spawn are the same violation."
+)
+
+_SLEEP_MESSAGE = (
+    "long sleeps are disabled in this kernel: never hold the turn to wait. "
+    "To wait, dispatch the wait through bash() (for a condition: "
+    "h = bash('while [ ! -f /app/done ]; do sleep 2; done')) and end the "
+    "turn; the [bash-done] notification wakes the session with the result."
+)
+
+
+class CellContractViolation(Exception):
+    """A cell broke the turn-hold contract and was refused before execution."""
+
+
+def _literal_number(node: ast.expr) -> float | None:
+    """The value of a numeric literal argument, or None."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(
+        node.value, bool
+    ):
+        return float(node.value)
+    return None
+
+
+def _cell_contract_violation(code: str) -> str | None:
+    """The guard message for the first turn-holding pattern in a cell, or None.
+
+    A parse failure is not the guard's report to make (_compile_cell owns the
+    SyntaxError path), so broken cells return None and fail on their own.
+    """
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            # A sole `import subprocess`/`import pty` is the command-hiding
+            # import; bundled unused imports are none of the contract's
+            # business - the call patterns below catch any actual use.
+            if len(node.names) == 1 and node.names[0].name in ("subprocess", "pty"):
+                return _SUBPROCESS_MESSAGE
+        elif isinstance(node, ast.ImportFrom):
+            if node.module in ("subprocess", "pty"):
+                return _SUBPROCESS_MESSAGE
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == "sleep":
+                arg = _literal_number(node.args[0]) if len(node.args) == 1 else None
+                if arg is not None and arg >= _SLEEP_LITERAL_FLOOR:
+                    return _SLEEP_MESSAGE
+                continue
+            if not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)):
+                continue
+            base, attr = func.value.id, func.attr
+            if base == "subprocess" and attr in _SUBPROCESS_CALLS:
+                return _SUBPROCESS_MESSAGE
+            if base == "os" and attr in ("system", "popen"):
+                return _SUBPROCESS_MESSAGE
+            if base == "pty" and attr == "spawn":
+                return _SUBPROCESS_MESSAGE
+            if base in ("time", "asyncio") and attr == "sleep":
+                arg = _literal_number(node.args[0]) if len(node.args) == 1 else None
+                if arg is not None and arg >= _SLEEP_LITERAL_FLOOR:
+                    return _SLEEP_MESSAGE
+    return None
+
+
+def _contract_violation_cell(message: str) -> str:
+    """The synthesized cell a violating submission runs instead: a raise with
+    the recipe, in a cell frame so the traceback carries the message."""
+    return f"from rlm.repl import CellContractViolation\nraise CellContractViolation({message!r})"
+
+
 def _compile_cell(code: str, filename: str) -> tuple[list[types.CodeType], bool]:
     """Compile a cell; a trailing expression compiles separately in eval mode."""
     linecache.cache[filename] = (len(code), None, code.splitlines(keepends=True), filename)
@@ -659,7 +753,9 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
     cell_token = _current_cell.set(cell_id)
     execution_token = _current_cell_execution.set(execution)
     try:
-        codes, has_trailing = _compile_cell(req["code"], filename)
+        violation = _cell_contract_violation(req["code"])
+        code = _contract_violation_cell(violation) if violation is not None else req["code"]
+        codes, has_trailing = _compile_cell(code, filename)
         assert _loop is not None
         task = _loop.create_task(_run_codes(codes, ns))
         execution.owner = task

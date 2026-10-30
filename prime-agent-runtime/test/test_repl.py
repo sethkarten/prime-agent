@@ -144,7 +144,7 @@ class ReplTest(unittest.TestCase):
         return repl
 
     def test_bash_activity_is_available_while_cell_is_running(self):
-        self.repl.send({"type": "execute", "id": "cell", "code": "from rlm import bash\nimport asyncio\nh = bash('echo ready; sleep 20'); await asyncio.sleep(20)"})
+        self.repl.send({"type": "execute", "id": "cell", "code": "from rlm import bash\nimport asyncio\nh = bash('echo ready; sleep 20')\nwhile True:\n    await asyncio.sleep(0.5)"})
         # Wait for the activity start display before requesting list.
         while True:
             event = self.repl.read_event()
@@ -184,7 +184,7 @@ class ReplTest(unittest.TestCase):
 
     def test_factory_activity_is_available_while_cell_is_running(self):
         repl = self.enabled_factory_repl()
-        repl.send({"type": "execute", "id": "cell", "code": "import asyncio\nawait asyncio.sleep(20)"})
+        repl.send({"type": "execute", "id": "cell", "code": "import asyncio\nwhile True:\n    await asyncio.sleep(0.5)"})
         # The factory graph answers out of band while the cell runs: no
         # live runs exist yet, so the graph action lists the empty registry.
         repl.send({"type": "factory_activity", "id": "g", "action": "graph"})
@@ -237,6 +237,40 @@ class ReplTest(unittest.TestCase):
 
         events = self.repl.execute("d", "_ + 40")
         self.assertEqual(one(events, "result")["text"], "42")
+
+    def test_cell_contract_rejects_subprocess(self):
+        events = self.repl.execute(
+            "guard-sub", "import subprocess\nsubprocess.run(['echo', 'hidden'])"
+        )
+        error = one(events, "error")
+        self.assertEqual(error["ename"], "CellContractViolation")
+        self.assertIn("bash()", error["evalue"])
+        self.assertIn("[bash-done]", error["evalue"])
+        self.assertEqual(one(events, "done")["status"], "error")
+        follow = self.repl.execute("after-sub", "1+1")
+        self.assertEqual(one(follow, "result")["text"], "2")
+
+    def test_cell_contract_rejects_long_sleep(self):
+        events = self.repl.execute("guard-sleep", "import time\ntime.sleep(30)\nprint('slept')")
+        error = one(events, "error")
+        self.assertEqual(error["ename"], "CellContractViolation")
+        self.assertIn("end the turn", error["evalue"])
+        self.assertIn("[bash-done]", error["evalue"])
+        self.assertEqual(one(events, "done")["status"], "error")
+
+    def test_cell_contract_allows_pacing_and_string_content(self):
+        # Sub-5 s pacing, a bundled unused subprocess import, and script text
+        # that merely mentions the banned calls are not the contract's business.
+        code = (
+            "import os, subprocess\n"
+            "import time\n"
+            "script = 'run: time.sleep(30) with subprocess'\n"
+            "time.sleep(0.05)\n"
+            "script[:1]"
+        )
+        events = self.repl.execute("guard-ok", code)
+        self.assertEqual(one(events, "result")["text"], "'r'")
+        self.assertEqual(one(events, "done")["status"], "ok")
 
     def test_stdout_stderr_and_direct_fd_writes(self):
         code = "\n".join(
@@ -455,7 +489,8 @@ class ReplTest(unittest.TestCase):
                 "if hasattr(signal, 'pthread_kill'):",
                 "    del signal.pthread_kill",
                 "import asyncio",
-                "await asyncio.sleep(30)",
+                "while True:",
+                "    await asyncio.sleep(0.5)",
             ]
         )
         self.repl.send({"type": "execute", "id": "nokill", "code": code})
@@ -572,11 +607,11 @@ class ReplTest(unittest.TestCase):
 
     def test_interrupt_await_suspended(self):
         events = self._interrupt_after_running(
-            "await", "import asyncio\nawait asyncio.sleep(1e9)"
+            "await", "import asyncio\nwhile True:\n    await asyncio.sleep(0.5)"
         )
         error = one(events, "error")
         self.assertEqual(error["ename"], "KeyboardInterrupt")
-        self.assertIn("await asyncio.sleep(1e9)", "".join(error["traceback"]))
+        self.assertIn("await asyncio.sleep(0.5)", "".join(error["traceback"]))
         self.assertEqual(one(events, "done")["status"], "error")
         follow = self.repl.execute("after-await", "2+2")
         self.assertEqual(one(follow, "result")["text"], "4")
@@ -602,7 +637,8 @@ class ReplTest(unittest.TestCase):
                 "    while True:",
                 "        time.sleep(0.05)",
                 "hog_task = asyncio.create_task(hog())",
-                "await asyncio.sleep(1e9)",
+                "while True:",
+                "    await asyncio.sleep(0.5)",
             ]
         )
         events = self._interrupt_after_running("fg", code)
@@ -615,7 +651,7 @@ class ReplTest(unittest.TestCase):
         self.assertEqual(one(follow, "result")["text"], "14")
 
     def test_interrupt_written_back_to_back_with_execute(self):
-        execute = json.dumps({"type": "execute", "id": "race", "code": "import asyncio\nawait asyncio.sleep(1e9)"})
+        execute = json.dumps({"type": "execute", "id": "race", "code": "import asyncio\nwhile True:\n    await asyncio.sleep(0.5)"})
         interrupt = json.dumps({"type": "interrupt"})
         assert self.repl.proc.stdin is not None
         self.repl.proc.stdin.write(execute + "\n" + interrupt + "\n")
@@ -649,8 +685,8 @@ class ReplTest(unittest.TestCase):
                 "import time",
                 "class SlowRepr:",
                 "    def __repr__(self):",
-                "        time.sleep(600)",
-                "        return 'late'",
+                "        while True:",
+                "            time.sleep(0.05)",
                 "SlowRepr()",
             ]
         )
