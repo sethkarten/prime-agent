@@ -144,7 +144,7 @@ class ReplTest(unittest.TestCase):
         return repl
 
     def test_bash_activity_is_available_while_cell_is_running(self):
-        self.repl.send({"type": "execute", "id": "cell", "code": "from rlm import bash\nimport asyncio\nh = bash('echo ready; sleep 20'); await asyncio.sleep(20)"})
+        self.repl.send({"type": "execute", "id": "cell", "code": "from rlm import bash\nimport asyncio\nh = bash('echo ready; sleep 20')\nawait asyncio.Event().wait()"})
         # Wait for the activity start display before requesting list.
         while True:
             event = self.repl.read_event()
@@ -184,7 +184,7 @@ class ReplTest(unittest.TestCase):
 
     def test_factory_activity_is_available_while_cell_is_running(self):
         repl = self.enabled_factory_repl()
-        repl.send({"type": "execute", "id": "cell", "code": "import asyncio\nawait asyncio.sleep(20)"})
+        repl.send({"type": "execute", "id": "cell", "code": "import asyncio\nawait asyncio.Event().wait()"})
         # The factory graph answers out of band while the cell runs: no
         # live runs exist yet, so the graph action lists the empty registry.
         repl.send({"type": "factory_activity", "id": "g", "action": "graph"})
@@ -344,7 +344,7 @@ class ReplTest(unittest.TestCase):
         )
         events = self.repl.execute("cell1", code)
         self.assertEqual(one(events, "done")["status"], "ok")
-        events = self.repl.execute("cell2", "import time\ntime.sleep(1.2)")
+        events = self.repl.execute("cell2", "import time\nfor _ in range(24):\n    time.sleep(0.05)")
         self.assertEqual(one(events, "done")["status"], "ok")
         # The SECRET lines may land during cell2 or right after; scan until both seen.
         deadline = time.monotonic() + 5
@@ -455,7 +455,7 @@ class ReplTest(unittest.TestCase):
                 "if hasattr(signal, 'pthread_kill'):",
                 "    del signal.pthread_kill",
                 "import asyncio",
-                "await asyncio.sleep(30)",
+                "await asyncio.Event().wait()",
             ]
         )
         self.repl.send({"type": "execute", "id": "nokill", "code": code})
@@ -572,11 +572,11 @@ class ReplTest(unittest.TestCase):
 
     def test_interrupt_await_suspended(self):
         events = self._interrupt_after_running(
-            "await", "import asyncio\nawait asyncio.sleep(1e9)"
+            "await", "import asyncio\nawait asyncio.Event().wait()"
         )
         error = one(events, "error")
         self.assertEqual(error["ename"], "KeyboardInterrupt")
-        self.assertIn("await asyncio.sleep(1e9)", "".join(error["traceback"]))
+        self.assertIn("await asyncio.Event().wait()", "".join(error["traceback"]))
         self.assertEqual(one(events, "done")["status"], "error")
         follow = self.repl.execute("after-await", "2+2")
         self.assertEqual(one(follow, "result")["text"], "4")
@@ -602,7 +602,7 @@ class ReplTest(unittest.TestCase):
                 "    while True:",
                 "        time.sleep(0.05)",
                 "hog_task = asyncio.create_task(hog())",
-                "await asyncio.sleep(1e9)",
+                "await asyncio.Event().wait()",
             ]
         )
         events = self._interrupt_after_running("fg", code)
@@ -615,7 +615,7 @@ class ReplTest(unittest.TestCase):
         self.assertEqual(one(follow, "result")["text"], "14")
 
     def test_interrupt_written_back_to_back_with_execute(self):
-        execute = json.dumps({"type": "execute", "id": "race", "code": "import asyncio\nawait asyncio.sleep(1e9)"})
+        execute = json.dumps({"type": "execute", "id": "race", "code": "import asyncio\nawait asyncio.Event().wait()"})
         interrupt = json.dumps({"type": "interrupt"})
         assert self.repl.proc.stdin is not None
         self.repl.proc.stdin.write(execute + "\n" + interrupt + "\n")
@@ -633,7 +633,7 @@ class ReplTest(unittest.TestCase):
         # the stale target of the finished request.
         events = self._interrupt_after_running("reuse", "import time\nwhile True:\n    time.sleep(0.05)")
         self.assertEqual(one(events, "error")["ename"], "KeyboardInterrupt")
-        self.repl.send({"type": "execute", "id": "reuse", "code": "import time\ntime.sleep(1.5)\nprint('survived')"})
+        self.repl.send({"type": "execute", "id": "reuse", "code": "import time\nfor _ in range(30):\n    time.sleep(0.05)\nprint('survived')"})
         time.sleep(0.4)  # let the cell enter its sleep before the stray SIGINT
         os.kill(self.repl.proc.pid, signal.SIGINT)
         events = self.repl.until_done("reuse")
@@ -649,7 +649,7 @@ class ReplTest(unittest.TestCase):
                 "import time",
                 "class SlowRepr:",
                 "    def __repr__(self):",
-                "        time.sleep(600)",
+                "        while True:\n            time.sleep(0.05)",
                 "        return 'late'",
                 "SlowRepr()",
             ]

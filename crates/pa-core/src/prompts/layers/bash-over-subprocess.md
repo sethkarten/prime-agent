@@ -1,1 +1,3 @@
 Never run shell commands through `subprocess`, `os.system`, or a helper that wraps them, even when you need the output. Start the command with `h = bash(cmd)`; in a later `ipython` call, collect `r = await h` (this returns instantly if the command already finished) and use `r.output` and `r.exit_code`. Only commands that finish in under a second may be awaited inline.
+
+The kernel enforces this contract: `subprocess`, `os.system`, and `os.popen` in a cell raise `TurnHoldError`, and a sleep past one second is refused. Never sleep or poll to wait for background work — end the turn; the `[bash-done]` notification wakes you with the result.

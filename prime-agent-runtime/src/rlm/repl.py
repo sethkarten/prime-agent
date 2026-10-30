@@ -33,6 +33,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from . import factory as factory_module
+from . import turnhold
 from .bash import _kill_live_handles, _rehydrate_persistent_shells
 
 PROTOCOL_VERSION = 3
@@ -1755,6 +1756,9 @@ def main() -> None:
     global _loop, _serve_task
     stdin_fd = _setup_fds()
     _start_owner_watchdog()
+    # A model cell cannot park the session: shell goes through bash(), waits
+    # end the turn (origin-scoped guards; see turnhold.py).
+    turnhold.install()
 
     # Alias the executing module so an in-cell `from rlm.repl import emit`
     # binds the live module, not a second copy.

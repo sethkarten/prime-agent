@@ -42,6 +42,18 @@ a time. A malformed line
 produces `{"event":"error","id":null,"ename":"ProtocolError",...}` and the
 runtime keeps serving. Closing stdin is equivalent to `shutdown`.
 
+## Turn-hold guards
+
+A model cell cannot park the session. Cell code that shells out through
+`subprocess`/`os.system`/`os.popen`/`pty.spawn`, or sleeps past one second,
+raises `TurnHoldError` with the prescribed alternative (`bash()` for shell,
+end the turn for waits) instead of holding the kernel. The guards are
+origin-scoped (`rlm/turnhold.py`): they fire only on the event-loop (main)
+thread, and only when the call chain reaches a `<cell-*>` frame without a
+runtime frame in between, so `bash()`'s own subprocess spawn, harness lock
+retries, MCP servers, watcher threads, and cell-spawned threads are
+unaffected. `install()` runs at kernel start in `main()`.
+
 ## Events
 
 - `{"event":"ready","protocol":3,"python":"3.13.11"}` — sent once at startup;
