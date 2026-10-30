@@ -602,12 +602,17 @@ def _interrupt_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
 # kernel cell from inside. The screen declines the cell before it runs, with
 # the allowed alternative in the error itself — a declined wait is a teaching
 # moment, not a held turn. Detection stays on the charged surface: literal
-# sleeps of 5s or more, and the subprocess family (import, call, os.system,
-# os.popen, pty.spawn). Anything else — short backoff sleeps, sleeps computed
-# from variables, library internals, sleeps and spawns inside string literals
-# or comments — is invisible to the screen and keeps running untouched.
+# sleeps (5s or more at the top level, 1s or more inside a loop), the
+# subprocess family (import, call, os.system, os.popen, pty.spawn), and the
+# two await-poll shapes the discipline contract names — awaiting a bash
+# handle inside a loop, and chaining three or more awaited commands in one
+# cell. Anything else — short top-level backoff sleeps, sleeps computed from
+# variables, library internals, sleeps and spawns inside string literals or
+# comments — is invisible to the screen and keeps running untouched.
 
 _DECLINE_SLEEP_SECONDS = 5.0
+_DECLINE_LOOP_SLEEP_SECONDS = 1.0
+_DECLINE_CHAINED_AWAITS = 3
 _WATCHED_MODULES = ("time", "asyncio", "subprocess", "os", "pty")
 _SUBPROCESS_CALLS = (
     "run",
@@ -630,9 +635,11 @@ def _declined_reason(code: str) -> CellDeclinedError | None:
 
     Import-aware where it can be (aliases bind through `import time as t` and
     `from time import sleep`), name-based where it must be (the contract's
-    `time.sleep(...)` shape is charged as written, imports or not). A cell
-    that does not parse declines nothing: the compile step reports the
-    SyntaxError.
+    `time.sleep(...)` shape is charged as written, imports or not). The
+    shapes: literal sleeps (5s top-level, 1s inside a loop), the subprocess
+    family, awaits of bash handles inside loops, and three or more awaited
+    commands chained in one cell. A cell that does not parse declines nothing:
+    the compile step reports the SyntaxError.
     """
     try:
         tree = ast.parse(code)
@@ -661,6 +668,80 @@ def _declined_reason(code: str) -> CellDeclinedError | None:
         source = ast.get_source_segment(code, node)
         return (source or "").replace("\n", " ")[:60]
 
+    # Loop ancestry (a sleep or an await inside a For/While is the poll shape)
+    # and the cell's bash handles: `x = bash(...)`, awaited directly or by name.
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+    loop_targets: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.For, ast.AsyncFor)) and isinstance(node.target, ast.Name):
+            loop_targets.add(node.target.id)
+    bash_names = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "bash"
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+
+    def inside_loop(node: ast.AST) -> bool:
+        cur = parents.get(id(node))
+        while cur is not None:
+            if isinstance(cur, (ast.For, ast.AsyncFor, ast.While)):
+                return True
+            cur = parents.get(id(cur))
+        return False
+
+    def refs_bash(node: ast.AST) -> bool:
+        """An awaited expression that waits on a bash handle: a bash(...) call
+        or a name assigned from one, anywhere inside it."""
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and sub.id in bash_names:
+                return True
+            if (
+                isinstance(sub, ast.Attribute)
+                and isinstance(sub.value, ast.Name)
+                and sub.value.id in bash_names
+            ):
+                return True
+            if (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Name)
+                and sub.func.id == "bash"
+            ):
+                return True
+        return False
+
+    awaited_bash = [node for node in ast.walk(tree) if isinstance(node, ast.Await) and refs_bash(node)]
+    for node in awaited_bash:
+        if inside_loop(node) and not (
+            isinstance(node.value, ast.Name) and node.value.id in loop_targets
+        ):
+            return CellDeclinedError(
+                f"{head(node)}: the kernel declines awaiting a bash handle inside "
+                "a loop - repeated awaits of a still-running handle are polling: "
+                "each pass parks the cell until the await's bound expires. End the "
+                "turn instead; the [bash-done] notification wakes the session "
+                "(awaiting the finished handle then returns instantly); arm "
+                "rlm_heartbeat.create for scheduled checks. Remove the loop and "
+                "rerun the cell."
+            )
+    if len(awaited_bash) >= _DECLINE_CHAINED_AWAITS:
+        return CellDeclinedError(
+            f"{len(awaited_bash)} awaited commands in one cell (first: "
+            f"{head(awaited_bash[0])}): the kernel declines the chained-await "
+            "shape - each await parks the cell in turn and the whole span is "
+            "charged as one held turn. Start the commands with bash('...') "
+            "without awaits and end the turn: the [bash-done] notifications "
+            "collect the results; or await one asyncio.gather(...) of the "
+            "handles. Split the cell and rerun."
+        )
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -677,15 +758,18 @@ def _declined_reason(code: str) -> CellDeclinedError | None:
             continue
         if root in ("time", "asyncio") and member == "sleep":
             seconds = _literal_seconds(node)
-            if seconds is not None and seconds >= _DECLINE_SLEEP_SECONDS:
+            looped = inside_loop(node)
+            floor = _DECLINE_LOOP_SLEEP_SECONDS if looped else _DECLINE_SLEEP_SECONDS
+            if seconds is not None and seconds >= floor:
+                shape = "a sleep inside a loop" if looped else "an in-cell sleep"
                 return CellDeclinedError(
-                    f"{head(node)}: the kernel declines in-cell sleeps of "
-                    f"{_DECLINE_SLEEP_SECONDS:g}s or longer - a sleeping cell parks "
-                    "the whole turn and nothing can wake it. End the turn instead: "
-                    "start the work with bash() (it returns immediately), reply with "
-                    "a short status text, and the [bash-done] notification wakes the "
-                    "session with the result; arm rlm_heartbeat.create for scheduled "
-                    "wakes. Remove the sleep and rerun the cell."
+                    f"{head(node)}: the kernel declines {shape} of {floor:g}s or "
+                    "longer - a sleeping cell parks the whole turn and nothing can "
+                    "wake it. End the turn instead: start the work with bash() (it "
+                    "returns immediately), reply with a short status text, and the "
+                    "[bash-done] notification wakes the session with the result; "
+                    "arm rlm_heartbeat.create for scheduled wakes. Remove the sleep "
+                    "and rerun the cell."
                 )
         if (
             (root == "subprocess" and member in _SUBPROCESS_CALLS)

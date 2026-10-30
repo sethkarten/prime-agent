@@ -738,6 +738,78 @@ class ReplTest(unittest.TestCase):
             self.assertIn("bash('...')", error["evalue"], rid)
             self.assertEqual(one(events, "done")["status"], "error", rid)
 
+    def test_discipline_screen_declines_loop_sleeps(self):
+        # The 3s-loop hole from the async-discipline profile: short sleeps
+        # inside a loop park the turn exactly like one long sleep.
+        for rid, code in (
+            ("loop-3s", "import time\nd = time.time() + 60\nwhile time.time() < d:\n    time.sleep(3)"),
+            ("loop-for", "import time\nfor i in range(10):\n    time.sleep(2)"),
+            ("loop-aio", "import asyncio\nwhile True:\n    await asyncio.sleep(1)"),
+        ):
+            events = self.repl.execute(rid, code)
+            error = one(events, "error")
+            self.assertEqual(error["ename"], "CellDeclinedError", rid)
+            self.assertIn("sleep", error["evalue"], rid)
+            self.assertEqual(one(events, "done")["status"], "error", rid)
+        # The same literals stay allowed outside a loop, and sub-second loop
+        # sleeps stay allowed (the interrupt-mechanism tests rely on them).
+        events = self.repl.execute("flat-3s", "import time\ntime.sleep(3)\nprint('ok')")
+        self.assertIsNone(one(events, "error"))
+        self.repl.send(
+            {"type": "execute", "id": "loop-fast", "code": "import time\nwhile True:\n    time.sleep(0.05)"}
+        )
+        self.repl.send({"type": "interrupt", "id": "loop-fast"})
+        self.assertEqual(one(self.repl.until_done("loop-fast"), "error")["ename"], "KeyboardInterrupt")
+
+    def test_discipline_screen_declines_awaits_inside_loops(self):
+        code = (
+            "from rlm import bash\n"
+            "handle = bash('sleep 2')\n"
+            "while True:\n"
+            "    result = await handle"
+        )
+        events = self.repl.execute("loop-await", code)
+        error = one(events, "error")
+        self.assertEqual(error["ename"], "CellDeclinedError")
+        self.assertIn("[bash-done]", error["evalue"])
+        self.assertEqual(one(events, "done")["status"], "error")
+        # Fan-in shapes stay allowed: awaiting the loop's own target.
+        allowed = (
+            "from rlm import bash\n"
+            "handles = [bash('printf one'), bash('printf two')]\n"
+            "for h in handles:\n"
+            "    await h"
+        )
+        events = self.repl.execute("fan-in", allowed)
+        self.assertIsNone(one(events, "error"))
+        self.assertEqual(one(events, "done")["status"], "ok")
+
+    def test_discipline_screen_declines_chained_awaits(self):
+        chained = (
+            "from rlm import bash\n"
+            "a = await bash('printf one')\n"
+            "b = await bash('printf two')\n"
+            "c = await bash('printf three')"
+        )
+        events = self.repl.execute("chained", chained)
+        error = one(events, "error")
+        self.assertEqual(error["ename"], "CellDeclinedError")
+        self.assertIn("3 awaited commands", error["evalue"])
+        self.assertEqual(one(events, "done")["status"], "error")
+        # Two sequential awaits and one gather of three handles stay allowed.
+        events = self.repl.execute(
+            "two-awaits", "from rlm import bash\na = await bash('printf one')\nb = await bash('printf two')"
+        )
+        self.assertIsNone(one(events, "error"))
+        events = self.repl.execute(
+            "gather",
+            "from rlm import bash\nimport asyncio\n"
+            "hs = [bash('printf one'), bash('printf two'), bash('printf three')]\n"
+            "print(await asyncio.gather(*hs))",
+        )
+        self.assertIsNone(one(events, "error"))
+        self.assertEqual(one(events, "done")["status"], "ok")
+
     def test_discipline_screen_spares_mentions_bash_and_libraries(self):
         code = (
             "import os\n"
