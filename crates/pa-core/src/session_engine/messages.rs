@@ -47,6 +47,13 @@ pub const ASYNC_BASH_COMPLETION_PREVIEW_LABEL: &str = "Background command finish
 pub const FACTORY_PROGRESS_NOTICE_CUSTOM_TYPE: &str = "factory_progress_notice";
 /// The queue-strip label the factory progress notice's queued row carries.
 pub const FACTORY_PROGRESS_PREVIEW_LABEL: &str = "Factory progress";
+/// The durable row the engine's mid-chain autonomous budget notices admit on
+/// the owning session's steering lane (the heads-up at 3/4 of the token cap
+/// and the cut at budget exhaustion, delivered while a tool chain holds the
+/// turn open).
+pub const AUTONOMOUS_BUDGET_NOTICE_CUSTOM_TYPE: &str = "autonomous_budget_notice";
+/// The queue-strip label the autonomous budget notice's queued row carries.
+pub const AUTONOMOUS_BUDGET_NOTICE_PREVIEW_LABEL: &str = "Autonomous budget";
 /// The queue-strip preview label for a parked heartbeat fire; the queued row reads
 /// `Heartbeat prompt: <content>` instead of the lane-labeled preview.
 pub const HEARTBEAT_PROMPT_PREVIEW_LABEL: &str = "Heartbeat prompt";
@@ -232,6 +239,26 @@ pub fn create_async_bash_completion_message(
             "command": command,
             "exitCode": exit_code,
         })),
+        timestamp,
+        rest: serde_json::Map::default(),
+    }
+}
+
+/// The autonomous budget notice row: the engine's own budget text (the
+/// heads-up or the cut) admitted as a steering row while the turn stays
+/// open — the model that never text-ends a turn otherwise sees no budget
+/// signal at all. The details keep the notice kind.
+#[must_use]
+pub fn create_autonomous_budget_message(
+    kind: &str,
+    text: &str,
+    timestamp: u64,
+) -> pa_types::session::CustomMessage {
+    pa_types::session::CustomMessage {
+        custom_type: AUTONOMOUS_BUDGET_NOTICE_CUSTOM_TYPE.to_string(),
+        content: UserContent::Text(text.to_string()),
+        display: true,
+        details: Some(serde_json::json!({ "kind": kind })),
         timestamp,
         rest: serde_json::Map::default(),
     }

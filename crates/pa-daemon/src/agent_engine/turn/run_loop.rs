@@ -212,9 +212,10 @@ impl AgentSessionEngine {
         }
     }
 
-    /// Arm the run's finalize wake: each new prompt wait may mint one wake at
+    /// Arm the run's finalize wake and mid-chain budget notices: each new
+    /// prompt wait may mint one wake and one of each mid-chain notice at
     /// budget exhaustion, except a run admitted as the wake itself (the
-    /// spent flag stays, so the wake cannot chain into itself).
+    /// spent flags stay, so the wake cannot chain into itself).
     pub(in crate::agent_engine) fn arm_finalize_wake(&self, prompt: &TurnPrompt) {
         let is_wake = match prompt {
             TurnPrompt::User { text, .. } => {
@@ -231,6 +232,8 @@ impl AgentSessionEngine {
         self.runtime.block_on(async {
             let mut state = self.autonomous.lock().await;
             state.finalize_wake_used = false;
+            state.mid_chain_heads_up_used = false;
+            state.mid_chain_cut_used = false;
         });
     }
 

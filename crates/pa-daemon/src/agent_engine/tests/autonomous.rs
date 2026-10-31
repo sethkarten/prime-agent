@@ -81,6 +81,73 @@ fn autonomous_limit_mints_last_call_wake_then_stops_without_a_row() {
     assert!(state.finalize_wake_used);
 }
 
+/// The mid-chain budget cut: an open tool chain never text-ends, so the
+/// exhausted turn budget steers onto the chain at the twelfth settled
+/// message — exactly one notice, with the real numbers — and the terminal
+/// wake still converts the chain at its text end.
+#[test]
+fn autonomous_mid_chain_cut_steers_an_open_tool_chain() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut responses = Vec::new();
+    for index in 0..13 {
+        responses.push(serde_json::json!({
+            "content": [
+                {"type": "toolCall", "name": "python_repl", "id": format!("mid_chain_{index}"),
+                 "arguments": {"code": "print(\"chain step\")"}}
+            ]
+        }));
+    }
+    responses.push(serde_json::json!("chain done"));
+    responses.push(serde_json::json!("finalizing"));
+    let (engine, _dir) =
+        faux_engine_with_settings(&serde_json::json!({ "responses": responses }), u64::MAX);
+    let engine = std::sync::Arc::new(engine);
+    engine.register_arc();
+    let notices: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collected = std::sync::Arc::clone(&notices);
+    engine.set_kernel_notice_sinks(
+        std::sync::Arc::new(move |notice| {
+            collected.lock().unwrap().push(notice.row.content.text());
+        }),
+        std::sync::Arc::new(|_consumed| {}),
+    );
+    let mut events: Vec<EngineEvent> = Vec::new();
+    admit(&engine, "/autonomous on".to_string(), &mut events);
+    admit(&engine, "go".to_string(), &mut events);
+    let notices = notices.lock().unwrap().clone();
+    assert_eq!(notices.len(), 1, "exactly one cut notice: {notices:?}");
+    assert!(
+        notices[0].starts_with("[autonomous-continuation: last-call]"),
+        "{notices:?}"
+    );
+    assert!(
+        notices[0]
+            .contains("The autonomous budget is exhausted mid-run: maxTurns reached (12/12)."),
+        "{notices:?}"
+    );
+    // The terminal wake still converts the chain at its text end.
+    let texts = user_texts(&events);
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.starts_with("[autonomous-continuation: finalize-wake]")),
+        "{texts:?}"
+    );
+    let state = engine.autonomous.blocking_lock();
+    assert!(state.mid_chain_cut_used);
+    assert!(
+        !state.mid_chain_heads_up_used,
+        "the spent cut suppresses the heads-up"
+    );
+    assert_eq!(
+        state.turns_used, 15,
+        "13 chain messages + the text end + the wake turn"
+    );
+}
+
 #[test]
 fn autonomous_gate_pass_and_failure_drive_the_loop() {
     let _faux = FAUX_TEST_LOCK

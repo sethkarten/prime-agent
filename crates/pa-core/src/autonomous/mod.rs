@@ -32,6 +32,13 @@ pub const AUTONOMOUS_FINALIZE_WAKE_PREFIX: &str = "[autonomous-continuation: fin
 /// The thin-budget last-call continuation prefix.
 pub const AUTONOMOUS_LAST_CALL_PREFIX: &str = "[autonomous-continuation: last-call]";
 
+/// The mid-chain budget status notice prefix (the heads-up steering row).
+pub const AUTONOMOUS_BUDGET_STATUS_PREFIX: &str = "[autonomous-continuation: budget-status]";
+
+/// The mid-chain heads-up fires at this fraction of the token cap: 3/4.
+pub const MID_CHAIN_HEADS_UP_NUMERATOR: u64 = 3;
+pub const MID_CHAIN_HEADS_UP_DENOMINATOR: u64 = 4;
+
 /// The last-call headroom on the wall-clock budget: with less than a
 /// minute left, the minted continuation may be the model's last turn.
 pub const LAST_CALL_TIMEOUT_HEADROOM_MS: u64 = 60 * 1000;
@@ -118,6 +125,7 @@ pub struct NormalizedGateConfig {
 
 /// The mutable runtime state for one autonomous run.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // the per-run notice/wake flags are flat by design
 pub struct AutonomousRuntimeState {
     pub enabled: bool,
     pub continuations_used: u64,
@@ -134,6 +142,12 @@ pub struct AutonomousRuntimeState {
     /// Whether this run already minted its finalize wake (the one grace turn
     /// the exhausted budget allows before the stop).
     pub finalize_wake_used: bool,
+    /// Whether this run already admitted its mid-chain budget heads-up
+    /// (the 3/4-of-tokens steering notice an open tool chain receives).
+    pub mid_chain_heads_up_used: bool,
+    /// Whether this run already admitted its mid-chain budget cut (the
+    /// exhausted-budget steering notice an open tool chain receives).
+    pub mid_chain_cut_used: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +236,8 @@ pub fn create_autonomous_runtime_state(
             last_gate_failure_snapshot: None,
             subagent_keep_alive_ms: normalize_subagent_keep_alive_ms(None),
             finalize_wake_used: false,
+            mid_chain_heads_up_used: false,
+            mid_chain_cut_used: false,
         };
     };
     AutonomousRuntimeState {
@@ -275,6 +291,8 @@ pub fn create_autonomous_runtime_state(
         last_gate_failure_snapshot: None,
         subagent_keep_alive_ms: normalize_subagent_keep_alive_ms(config.subagent_keep_alive_ms),
         finalize_wake_used: false,
+        mid_chain_heads_up_used: false,
+        mid_chain_cut_used: false,
     }
 }
 
@@ -289,6 +307,8 @@ pub fn set_autonomous_enabled(state: &mut AutonomousRuntimeState, enabled: bool)
         state.turns_used = 0;
         state.tokens_used = 0;
         state.finalize_wake_used = false;
+        state.mid_chain_heads_up_used = false;
+        state.mid_chain_cut_used = false;
         state.started_at = Some(now_millis());
     } else {
         state.started_at = None;
@@ -488,6 +508,58 @@ pub fn build_autonomous_last_call_text(state: &AutonomousRuntimeState, now: u64)
         state.limits.max_continuations,
         state.tokens_used,
         state.limits.max_tokens,
+        crate::session::manager::format_iso(now as i64),
+    )
+}
+
+/// Whether the mid-chain budget heads-up is due: the token spend crossed
+/// 3/4 of the cap while a tool chain holds the turn open.
+#[must_use]
+pub fn autonomous_mid_chain_heads_up_due(state: &AutonomousRuntimeState) -> bool {
+    state.enabled
+        && !state.mid_chain_heads_up_used
+        && state
+            .tokens_used
+            .saturating_mul(MID_CHAIN_HEADS_UP_DENOMINATOR)
+            >= state
+                .limits
+                .max_tokens
+                .saturating_mul(MID_CHAIN_HEADS_UP_NUMERATOR)
+}
+
+/// The mid-chain budget heads-up: the steering notice an open tool chain
+/// receives once the token spend crosses 3/4 of the cap — the model that
+/// never ends a turn otherwise sees no budget signal at all.
+#[must_use]
+pub fn build_autonomous_mid_chain_heads_up_text(
+    state: &AutonomousRuntimeState,
+    now: u64,
+) -> String {
+    format!(
+        "{AUTONOMOUS_BUDGET_STATUS_PREFIX}\n\nBudget status: turns {}/{}, continuations {}/{}, tokens {}/{} — the token budget is three quarters spent. Plan your wrap-up: prefer finishing the deliverable files over opening new lines of work, and keep the task's submission step in reach. Timestamp: {}.",
+        state.turns_used,
+        state.limits.max_turns,
+        state.continuations_used,
+        state.limits.max_continuations,
+        state.tokens_used,
+        state.limits.max_tokens,
+        crate::session::manager::format_iso(now as i64),
+    )
+}
+
+/// The mid-chain budget cut: the steering notice an open tool chain
+/// receives once the budget is exhausted — the chain that would otherwise
+/// run unbounded past the cap hears the same directive the terminal wake
+/// carries, mid-chain at the next tool boundary.
+#[must_use]
+pub fn build_autonomous_mid_chain_cut_text(
+    status: &AgentAutonomousStatus,
+    reason: AutonomousLimitReason,
+    now: u64,
+) -> String {
+    format!(
+        "{AUTONOMOUS_LAST_CALL_PREFIX}\n\nThe autonomous budget is exhausted mid-run: {}. The run stops at the next turn end — do not open new work.\n\nFinalize NOW: write the deliverable files the task asks for to disk, run the task's submission or finish step exactly as the task instructions define it, and end your turn with the final result. A partial deliverable on disk is strictly better than none. Timestamp: {}.",
+        describe_autonomous_limit(status, reason, now),
         crate::session::manager::format_iso(now as i64),
     )
 }
@@ -779,6 +851,34 @@ mod tests {
         assert!(last_call.contains("turns 0/12, continuations 1/3, tokens 0/80000"));
         assert!(last_call
             .contains("run the task's submission or finish step as soon as the work is done"));
+    }
+
+    #[test]
+    fn mid_chain_heads_up_due_and_texts() {
+        let mut state = create_autonomous_runtime_state(Some(&config(true)), None);
+        assert!(!autonomous_mid_chain_heads_up_due(&state));
+        // 3/4 of the token cap.
+        state.tokens_used = state.limits.max_tokens * 3 / 4;
+        assert!(autonomous_mid_chain_heads_up_due(&state));
+        let heads_up = build_autonomous_mid_chain_heads_up_text(&state, 0);
+        assert!(heads_up.starts_with("[autonomous-continuation: budget-status]"));
+        assert!(heads_up.contains("the token budget is three quarters spent"));
+        assert!(heads_up.contains("turns 0/12, continuations 0/3"));
+        assert!(heads_up.contains("Plan your wrap-up"));
+        // Once fired, the flag holds the notice back.
+        state.mid_chain_heads_up_used = true;
+        assert!(!autonomous_mid_chain_heads_up_due(&state));
+        // The mid-chain cut: the same numbers the terminal wake carries,
+        // delivered mid-chain while the tool chain holds the turn open.
+        state.tokens_used = state.limits.max_tokens;
+        let status = autonomous_status(&state);
+        let cut = build_autonomous_mid_chain_cut_text(&status, AutonomousLimitReason::MaxTokens, 0);
+        assert!(cut.starts_with("[autonomous-continuation: last-call]"));
+        assert!(cut.contains(
+            "The autonomous budget is exhausted mid-run: maxTokens reached (80000/80000)."
+        ));
+        assert!(cut.contains("The run stops at the next turn end"));
+        assert!(cut.contains("A partial deliverable on disk is strictly better than none"));
     }
 
     #[test]

@@ -98,6 +98,15 @@ impl AgentSessionEngine {
                     .read()
                     .expect("autonomous driver lock"),
             );
+            // The mid-chain budget notices admit through the worker's
+            // kernel-notice steering seam (the `[bash-done]` path): an open
+            // tool chain never text-ends, so the driver's budget signals
+            // otherwise never reach the model.
+            let kernel_notice_sink = self
+                .kernel_notice_sink
+                .lock()
+                .expect("kernel notice sink lock")
+                .clone();
             agent
                 .subscribe(move |event, _signal| {
                     let tx = tx.clone();
@@ -107,8 +116,10 @@ impl AgentSessionEngine {
                     let autonomous_driver = std::sync::Arc::clone(&autonomous_driver);
                     let goal_runtime = goal_runtime.clone();
                     let goal_budget_crossed = goal_budget_crossed.clone();
+                    let kernel_notice_sink = kernel_notice_sink.clone();
                     Box::pin(async move {
                         use pa_agent::types::AgentEvent;
+                        let mut mid_chain_notice: Option<(&str, String)> = None;
                         if let AgentEvent::MessageEnd {
                             message:
                                 pa_agent::types::AgentMessage::Standard(
@@ -121,6 +132,48 @@ impl AgentSessionEngine {
                             {
                                 let mut state = autonomous_state.lock().await;
                                 autonomous_driver.account_message(&mut state, &message);
+                                // The mid-chain budget seam (token-aware
+                                // cost lever): the exhausted-budget cut and
+                                // the 3/4 heads-up steer onto the open turn,
+                                // once per run each, with the real numbers.
+                                // Mid-chain means the message ended on a
+                                // tool call — at a text end the driver's own
+                                // continuations carry the budget signal.
+                                mid_chain_notice = if !state.enabled
+                                    || message.stop_reason != pa_types::ai::StopReason::ToolUse
+                                {
+                                    None
+                                } else if !state.mid_chain_cut_used {
+                                    let now = pa_core::autonomous::now_millis();
+                                        pa_core::autonomous::autonomous_limit_reason(&state, now)
+                                            .map(|reason| {
+                                                state.mid_chain_cut_used = true;
+                                                let status =
+                                                    pa_core::autonomous::autonomous_status(&state);
+                                                (
+                                                    "cut",
+                                                    pa_core::autonomous::
+                                                        build_autonomous_mid_chain_cut_text(
+                                                        &status, reason, now,
+                                                    ),
+                                                )
+                                            })
+                                    } else if !state.mid_chain_cut_used
+                                        && pa_core::autonomous::
+                                            autonomous_mid_chain_heads_up_due(&state)
+                                    {
+                                        state.mid_chain_heads_up_used = true;
+                                        let now = pa_core::autonomous::now_millis();
+                                        Some((
+                                            "heads-up",
+                                            pa_core::autonomous::
+                                                build_autonomous_mid_chain_heads_up_text(
+                                                    &state, now,
+                                                ),
+                                        ))
+                                    } else {
+                                        None
+                                    };
                                 // Goal accounting: only turns neither errors
                                 // nor aborted spend the budget, only while
                                 // active.
@@ -158,6 +211,17 @@ impl AgentSessionEngine {
                                         }
                                     }
                                 }
+                            }
+                        }
+                        // The state lock is released: the notice admission
+                        // takes the worker's queue locks, never the driver's.
+                        if let Some((kind, text)) = mid_chain_notice {
+                            if let Some(notice) = kernel_notice_sink.as_ref() {
+                                notice(
+                                    pa_core::session_engine::bash_notices::KernelNotice::autonomous_budget(
+                                        kind, &text,
+                                    ),
+                                );
                             }
                         }
                         match &event {

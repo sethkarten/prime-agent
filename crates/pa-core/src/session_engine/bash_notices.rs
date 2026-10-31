@@ -46,6 +46,21 @@ impl KernelNotice {
             preview_label: ASYNC_BASH_COMPLETION_PREVIEW_LABEL,
         }
     }
+
+    /// The mid-chain autonomous budget notice (the 3/4 heads-up or the
+    /// exhausted-budget cut): the engine's own budget text admitted while a
+    /// tool chain holds the turn open.
+    #[must_use]
+    pub fn autonomous_budget(kind: &str, text: &str) -> Self {
+        Self {
+            row: messages::create_autonomous_budget_message(
+                kind,
+                text,
+                crate::autonomous::now_millis(),
+            ),
+            preview_label: messages::AUTONOMOUS_BUDGET_NOTICE_PREVIEW_LABEL,
+        }
+    }
 }
 
 /// The queue-admission seam for one kernel notice (the daemon worker's
