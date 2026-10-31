@@ -19,10 +19,18 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT: &str = "No human input is available in autonomous mode. Continue working until the host evaluator, verifier, or configured autonomous limits stop the run. If you were asking the user a question, make a reasonable assumption and verify it. If you believe you are blocked, prove it with host-observable evidence, preserve that evidence, and keep looking for safe progress while budget remains. Do not end the session yourself; the verifier/evaluator decides completion when configured gates pass.";
 
+/// Continuation pushes allowed without intervening tool work: an inert run
+/// stops after this many pushes, while any tool-call turn resets the counter,
+/// so a productive run is never starved at a mid-work pause.
 pub const DEFAULT_MAX_CONTINUATIONS: u64 = 3;
-pub const DEFAULT_MAX_TURNS: u64 = 12;
-pub const DEFAULT_MAX_TOKENS: u64 = 80_000;
-pub const DEFAULT_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+/// Conversation turns (natural turn ends), not model requests: a tool-call
+/// chain inside one conversation turn spends no turn budget.
+pub const DEFAULT_MAX_TURNS: u64 = 24;
+/// Input + output + cache-write tokens, counted per settled message.
+pub const DEFAULT_MAX_TOKENS: u64 = 512_000;
+/// Wall-clock runaway bound; sized above a host evaluator's own task budget
+/// so the host, not this leash, owns the wall clock.
+pub const DEFAULT_TIMEOUT_MS: u64 = 4 * 60 * 60 * 1000;
 pub const DEFAULT_GATE_MAX_RETRIES: u64 = 3;
 pub const DEFAULT_GATE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 /// One keep-alive continuation per 25 minutes of continuous subagent
@@ -84,6 +92,11 @@ pub struct AutonomousLimits {
 pub struct AgentAutonomousStatus {
     pub enabled: bool,
     pub continuations_used: u64,
+    /// Continuation pushes since the last tool-call turn (`None` on rows
+    /// persisted before the field existed; the total is the fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuations_since_work: Option<u64>,
+    /// Conversation turns (natural turn ends) spent.
     pub turns_used: u64,
     pub tokens_used: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,6 +123,12 @@ pub struct NormalizedGateConfig {
 pub struct AutonomousRuntimeState {
     pub enabled: bool,
     pub continuations_used: u64,
+    /// Continuation pushes minted since the last turn that ran tool calls:
+    /// the counter the `max_continuations` cap actually binds. A tool-call
+    /// turn resets it, so pushes only starve runs that never act.
+    pub continuations_since_work: u64,
+    /// Conversation turns (natural turn ends) spent: one per settled turn
+    /// the driver is consulted for, not one per model request.
     pub turns_used: u64,
     pub tokens_used: u64,
     pub started_at: Option<u64>,
@@ -185,6 +204,7 @@ pub fn create_autonomous_runtime_state(
         return AutonomousRuntimeState {
             enabled: false,
             continuations_used: 0,
+            continuations_since_work: 0,
             turns_used: 0,
             tokens_used: 0,
             started_at: None,
@@ -212,6 +232,7 @@ pub fn create_autonomous_runtime_state(
     AutonomousRuntimeState {
         enabled,
         continuations_used: 0,
+        continuations_since_work: 0,
         turns_used: 0,
         tokens_used: 0,
         started_at: enabled.then(now_millis),
@@ -270,6 +291,7 @@ pub fn set_autonomous_enabled(state: &mut AutonomousRuntimeState, enabled: bool)
     state.last_gate_failure_snapshot = None;
     if enabled {
         state.continuations_used = 0;
+        state.continuations_since_work = 0;
         state.turns_used = 0;
         state.tokens_used = 0;
         state.started_at = Some(now_millis());
@@ -308,6 +330,7 @@ pub fn autonomous_status(state: &AutonomousRuntimeState) -> AgentAutonomousStatu
     AgentAutonomousStatus {
         enabled: state.enabled,
         continuations_used: state.continuations_used,
+        continuations_since_work: Some(state.continuations_since_work),
         turns_used: state.turns_used,
         tokens_used: state.tokens_used,
         started_at: state.started_at,
@@ -319,7 +342,9 @@ pub fn autonomous_status(state: &AutonomousRuntimeState) -> AgentAutonomousStatu
     }
 }
 
-/// Account one settled assistant message (per-message usage accounting).
+/// Account one settled assistant message (per-message token accounting).
+/// Turn budget is not spent here: a turn is a conversation turn, counted at
+/// the natural turn end the driver consults for ([`add_autonomous_conversation_turn`]).
 pub fn add_autonomous_usage(
     state: &mut AutonomousRuntimeState,
     usage: Option<&pa_types::ai::Usage>,
@@ -327,8 +352,25 @@ pub fn add_autonomous_usage(
     if !state.enabled {
         return;
     }
-    state.turns_used += 1;
     state.tokens_used += autonomous_token_delta(usage);
+}
+
+/// A settled turn ran tools: productive work resets the continuation-push
+/// counter, so the `max_continuations` cap only starves runs that never act.
+pub fn note_autonomous_work(state: &mut AutonomousRuntimeState) {
+    if !state.enabled {
+        return;
+    }
+    state.continuations_since_work = 0;
+}
+
+/// Spend one conversation turn: called once per natural turn end the driver
+/// is consulted for (the boundary a continuation would ride).
+pub fn add_autonomous_conversation_turn(state: &mut AutonomousRuntimeState) {
+    if !state.enabled {
+        return;
+    }
+    state.turns_used += 1;
 }
 
 pub fn add_autonomous_continuation(state: &mut AutonomousRuntimeState) {
@@ -336,6 +378,7 @@ pub fn add_autonomous_continuation(state: &mut AutonomousRuntimeState) {
         return;
     }
     state.continuations_used += 1;
+    state.continuations_since_work += 1;
 }
 
 /// Cache-read tokens are repeated context served from the provider cache;
@@ -363,7 +406,10 @@ pub fn autonomous_limit_reason_of_status(
     status: &AgentAutonomousStatus,
     now: u64,
 ) -> Option<AutonomousLimitReason> {
-    if status.continuations_used >= status.limits.max_continuations {
+    let pushes_since_work = status
+        .continuations_since_work
+        .unwrap_or(status.continuations_used);
+    if pushes_since_work >= status.limits.max_continuations {
         return Some(AutonomousLimitReason::MaxContinuations);
     }
     if status.turns_used >= status.limits.max_turns {
@@ -386,7 +432,7 @@ pub fn autonomous_limit_reason(
     state: &AutonomousRuntimeState,
     now: u64,
 ) -> Option<AutonomousLimitReason> {
-    if state.continuations_used >= state.limits.max_continuations {
+    if state.continuations_since_work >= state.limits.max_continuations {
         return Some(AutonomousLimitReason::MaxContinuations);
     }
     if state.turns_used >= state.limits.max_turns {
@@ -426,7 +472,75 @@ pub fn build_autonomous_gate_failure_continuation(
 
 #[must_use]
 pub fn autonomous_continuation_text(state: &AutonomousRuntimeState) -> String {
-    format!("[autonomous-continuation]\n\n{}", state.continuation_prompt)
+    format!(
+        "[autonomous-continuation]\n\n{}\n\n{}",
+        state.continuation_prompt,
+        autonomous_budget_line(state)
+    )
+}
+
+/// The live budget report appended to every continuation: what the run has
+/// spent and what is left of each cap, so the agent plans against the budget
+/// instead of discovering it by being stopped. Tool-call chains spend no
+/// turn budget; a pause that follows work always has pushes left.
+#[must_use]
+pub fn autonomous_budget_line(state: &AutonomousRuntimeState) -> String {
+    let elapsed_ms = state
+        .started_at
+        .map(|started_at| now_millis().saturating_sub(started_at))
+        .unwrap_or_default();
+    let wall = if is_unlimited_autonomous_limit(state.limits.timeout_ms) {
+        "wall unlimited".to_string()
+    } else {
+        format!(
+            "wall {}m of {}m",
+            elapsed_ms / 60_000,
+            state.limits.timeout_ms / 60_000
+        )
+    };
+    let mut line = format!(
+        "Budget: conversation turn {} of {}; continuation pushes since your last tool work {} of {}; tokens {} of {}; {}.",
+        state.turns_used,
+        state.limits.max_turns,
+        state.continuations_since_work,
+        state.limits.max_continuations,
+        state.tokens_used,
+        state.limits.max_tokens,
+        wall,
+    );
+    if let Some(tightest) = autonomous_deadline_trigger(state, elapsed_ms) {
+        line.push_str(&format!(
+            " Budget nearly exhausted ({tightest}). Converge now: finish the deliverable and write every final artifact the task requires; do not start new exploration. When the task is complete, end your turn with your answer."
+        ));
+    }
+    line
+}
+
+/// The first budget within 20% of its cap (or two conversation turns of
+/// its cap), if any: the trigger the convergence directive names.
+fn autonomous_deadline_trigger(
+    state: &AutonomousRuntimeState,
+    elapsed_ms: u64,
+) -> Option<&'static str> {
+    if !is_unlimited_autonomous_limit(state.limits.max_turns)
+        && state.limits.max_turns.saturating_sub(state.turns_used) <= 2
+    {
+        return Some("conversation turns");
+    }
+    if !is_unlimited_autonomous_limit(state.limits.max_tokens)
+        && state
+            .tokens_used
+            .saturating_mul(5)
+            >= state.limits.max_tokens.saturating_mul(4)
+    {
+        return Some("tokens");
+    }
+    if !is_unlimited_autonomous_limit(state.limits.timeout_ms)
+        && elapsed_ms.saturating_mul(5) >= state.limits.timeout_ms.saturating_mul(4)
+    {
+        return Some("wall time");
+    }
+    None
 }
 
 /// The continuation row an in-run continuation hook returns to the agent loop; the loop emits and
@@ -570,7 +684,7 @@ mod tests {
     #[test]
     fn enable_resets_and_disable_clears() {
         let mut state = create_autonomous_runtime_state(Some(&config(true)), None);
-        add_autonomous_usage(&mut state, Some(&usage(10, 5)));
+        add_autonomous_conversation_turn(&mut state);
         add_autonomous_continuation(&mut state);
         set_autonomous_enabled(&mut state, false);
         assert!(!state.enabled);
@@ -579,6 +693,7 @@ mod tests {
         set_autonomous_enabled(&mut state, true);
         assert_eq!(state.turns_used, 0);
         assert_eq!(state.continuations_used, 0);
+        assert_eq!(state.continuations_since_work, 0);
         assert!(state.started_at.is_some());
     }
 
@@ -593,7 +708,9 @@ mod tests {
             },
             Some(&usage(9, 9)),
         );
-        assert_eq!(state.turns_used, 1);
+        // Turns are conversation turns counted at driver consults, not
+        // per-message; usage accounting is tokens only.
+        assert_eq!(state.turns_used, 0);
         // input 100 + output 40 + cacheWrite 100.
         assert_eq!(state.tokens_used, 240);
     }
@@ -603,11 +720,23 @@ mod tests {
         let mut state = create_autonomous_runtime_state(Some(&config(true)), None);
         let now = state.started_at.unwrap_or(0);
         assert_eq!(autonomous_limit_reason(&state, now), None);
-        state.continuations_used = state.limits.max_continuations;
+        state.continuations_since_work = state.limits.max_continuations;
         assert_eq!(
             autonomous_limit_reason(&state, u64::MAX),
             Some(AutonomousLimitReason::MaxContinuations)
         );
+        // A lifetime push count over the cap does not stop a run whose
+        // pushes follow tool work: only pushes without work bind.
+        state.continuations_used = state.limits.max_continuations + 5;
+        state.continuations_since_work = 0;
+        assert_eq!(autonomous_limit_reason(&state, now), None);
+        state.continuations_since_work = state.limits.max_continuations;
+        state.continuations_used = 0;
+        assert_eq!(
+            autonomous_limit_reason(&state, now),
+            Some(AutonomousLimitReason::MaxContinuations)
+        );
+        state.continuations_since_work = 0;
         state.continuations_used = 0;
         state.turns_used = state.limits.max_turns;
         assert_eq!(
@@ -631,10 +760,24 @@ mod tests {
     #[test]
     fn continuation_texts() {
         let state = create_autonomous_runtime_state(Some(&config(true)), None);
-        assert_eq!(
-            autonomous_continuation_text(&state),
-            format!("[autonomous-continuation]\n\n{DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT}")
-        );
+        let text = autonomous_continuation_text(&state);
+        assert!(text.starts_with(&format!(
+            "[autonomous-continuation]\n\n{DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT}"
+        )));
+        // The continuation carries the live budget report.
+        assert!(text.contains(&format!(
+            "conversation turn 0 of {};",
+            DEFAULT_MAX_TURNS
+        )));
+        assert!(text.contains(&format!(
+            "continuation pushes since your last tool work 0 of {};",
+            DEFAULT_MAX_CONTINUATIONS
+        )));
+        assert!(text.contains(&format!(
+            "tokens 0 of {};",
+            DEFAULT_MAX_TOKENS
+        )));
+        assert!(!text.contains("Converge now"));
         let failure = AgentAutonomousGateFailure {
             command: "make check".to_string(),
             attempt: 2,
@@ -650,6 +793,78 @@ mod tests {
             .contains("at least 1 minute without"));
         assert!(create_autonomous_subagent_keep_alive_text(&state)
             .contains("at least 25 minutes without"));
+    }
+
+    #[test]
+    fn work_resets_the_push_budget() {
+        let mut state = create_autonomous_runtime_state(Some(&config(true)), None);
+        let now = state.started_at.unwrap_or(0);
+        for _ in 0..state.limits.max_continuations {
+            add_autonomous_continuation(&mut state);
+        }
+        assert_eq!(
+            autonomous_limit_reason(&state, now),
+            Some(AutonomousLimitReason::MaxContinuations)
+        );
+        // A tool-call turn resets the pushes-since-work counter: the same
+        // lifetime count no longer binds.
+        note_autonomous_work(&mut state);
+        assert_eq!(state.continuations_since_work, 0);
+        assert_eq!(autonomous_limit_reason(&state, now), None);
+    }
+
+    #[test]
+    fn status_carries_pushes_since_work() {
+        let mut state = create_autonomous_runtime_state(Some(&config(true)), None);
+        let now = state.started_at.unwrap_or(0);
+        state.continuations_used = 4;
+        state.continuations_since_work = 1;
+        let status = autonomous_status(&state);
+        assert_eq!(status.continuations_since_work, Some(1));
+        // The limit reads the pushes-since-work number.
+        assert_eq!(autonomous_limit_reason_of_status(&status, now), None);
+        state.continuations_since_work = state.limits.max_continuations;
+        let status = autonomous_status(&state);
+        assert_eq!(
+            autonomous_limit_reason_of_status(&status, now),
+            Some(AutonomousLimitReason::MaxContinuations)
+        );
+        // Rows persisted before the field existed fall back to the total.
+        let mut legacy = status.clone();
+        legacy.continuations_since_work = None;
+        legacy.continuations_used = legacy.limits.max_continuations;
+        assert_eq!(
+            autonomous_limit_reason_of_status(&legacy, now),
+            Some(AutonomousLimitReason::MaxContinuations)
+        );
+    }
+
+    #[test]
+    fn budget_line_escalates_near_the_caps() {
+        let mut state = create_autonomous_runtime_state(Some(&config(true)), None);
+        state.turns_used = state.limits.max_turns - 2;
+        let line = autonomous_budget_line(&state);
+        assert!(line.contains("conversation turns"));
+        assert!(line.contains("Converge now"));
+
+        let mut state = create_autonomous_runtime_state(Some(&config(true)), None);
+        state.tokens_used = state.limits.max_tokens * 4 / 5;
+        assert!(autonomous_budget_line(&state).contains("(tokens)."));
+
+        let mut state = create_autonomous_runtime_state(Some(&config(true)), None);
+        state.started_at = Some(1);
+        let now = 1 + state.limits.timeout_ms * 4 / 5;
+        let line = {
+            // The wall trigger reads the elapsed time against the timeout.
+            let elapsed = now.saturating_sub(state.started_at.unwrap_or(0));
+            assert!(autonomous_deadline_trigger(&state, elapsed).is_some());
+            autonomous_budget_line(&state)
+        };
+        assert!(line.contains("Converge now"));
+
+        // Far from every cap: no directive.
+        let state = create_autonomous_runtime_state(Some(&config(true)), None);
+        assert!(!autonomous_budget_line(&state).contains("Converge now"));
     }
 
     #[test]
@@ -670,7 +885,7 @@ mod tests {
         );
         assert_eq!(
             describe_autonomous_limit(&status, AutonomousLimitReason::MaxTokens, 0),
-            "maxTokens reached (0/80000)"
+            format!("maxTokens reached (0/{})", DEFAULT_MAX_TOKENS)
         );
         let started = status.started_at.unwrap_or(0);
         assert_eq!(

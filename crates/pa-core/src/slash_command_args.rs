@@ -344,9 +344,14 @@ pub fn format_autonomous_status(status: &AgentAutonomousStatus) -> String {
     } else {
         "off".to_string()
     };
+    let pushes_since_work = status
+        .continuations_since_work
+        .unwrap_or(status.continuations_used);
     format!(
-        "[autonomous-status: {state}]\n\nContinuations: {}/{}. Turns: {}/{}. Tokens: {}/{}. Time: {elapsed_seconds}s/{time_budget}. Gates: {gate_summary}. Subagent keep-alive: {keep_alive}.",
+        "[autonomous-status: {state}]\n\nContinuations: {}/{} (since last tool work: {}/{}). Conversation turns: {}/{}. Tokens: {}/{}. Time: {elapsed_seconds}s/{time_budget}. Gates: {gate_summary}. Subagent keep-alive: {keep_alive}.",
         format_count(status.continuations_used),
+        format_count(status.limits.max_continuations),
+        format_count(pushes_since_work),
         format_count(status.limits.max_continuations),
         format_count(status.turns_used),
         format_count(status.limits.max_turns),
@@ -450,7 +455,7 @@ mod tests {
         let status = crate::autonomous::autonomous_status(&state);
         let text = format_autonomous_status(&status);
         assert!(text.starts_with("[autonomous-status: off]"));
-        assert!(text.contains("Continuations: 0/3. Turns: 0/12. Tokens: 0/80,000."));
-        assert!(text.contains("Time: 0s/1,800s. Gates: none. Subagent keep-alive: 25m."));
+        assert!(text.contains("Continuations: 0/3 (since last tool work: 0/3). Conversation turns: 0/24. Tokens: 0/512,000."));
+        assert!(text.contains("Time: 0s/14,400s. Gates: none. Subagent keep-alive: 25m."));
     }
 }

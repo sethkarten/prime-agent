@@ -34,13 +34,15 @@ fn autonomous_limit_stops_the_run_without_a_row() {
     // 2 hits the cap; the stop writes no row.
     assert_eq!(assistant_texts(&events), vec!["first", "second"]);
     let texts = user_texts(&events);
-    assert_eq!(
-        texts,
-        vec![
-            "go".to_string(),
-            "[autonomous-continuation]\n\nNo human input is available in autonomous mode. Continue working until the host evaluator, verifier, or configured autonomous limits stop the run. If you were asking the user a question, make a reasonable assumption and verify it. If you believe you are blocked, prove it with host-observable evidence, preserve that evidence, and keep looking for safe progress while budget remains. Do not end the session yourself; the verifier/evaluator decides completion when configured gates pass.".to_string()
-        ]
-    );
+    assert_eq!(texts.len(), 2);
+    assert_eq!(texts[0], "go");
+    assert!(texts[1].starts_with(
+        "[autonomous-continuation]\n\nNo human input is available in autonomous mode."
+    ));
+    // The continuation carries the live budget report.
+    assert!(texts[1].contains("Budget: conversation turn 1 of 5;"));
+    assert!(texts[1]
+        .contains("continuation pushes since your last tool work 1 of 1;"));
     // One `turn_start` frame between the settled `turn_end` and the continuation user row.
     let turn_ends = events
         .iter()

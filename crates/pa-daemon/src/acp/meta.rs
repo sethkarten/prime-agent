@@ -283,6 +283,7 @@ mod tests {
         let status = |enabled: bool, turns_used: u64| AgentAutonomousStatus {
             enabled,
             continuations_used: 0,
+            continuations_since_work: None,
             turns_used,
             tokens_used: 1_000,
             started_at: None,

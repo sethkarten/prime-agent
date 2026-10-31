@@ -1791,10 +1791,12 @@ fn quiescence_meta(
         remaining_autonomous_continuations: status.filter(|status| status.enabled).map_or(
             0,
             |status| {
+                // The push allowance that actually binds: pushes since the
+                // last tool-call turn, not the run's lifetime total.
                 status
                     .limits
                     .max_continuations
-                    .saturating_sub(status.continuations_used)
+                    .saturating_sub(status.continuations_since_work.unwrap_or(status.continuations_used))
             },
         ),
     }

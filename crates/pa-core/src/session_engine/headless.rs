@@ -354,6 +354,7 @@ mod tests {
         let mut status = AgentAutonomousStatus {
             enabled: true,
             continuations_used: 2,
+            continuations_since_work: None,
             turns_used: 5,
             tokens_used: 1_000,
             started_at: Some(1_000),

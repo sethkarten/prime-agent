@@ -7,9 +7,10 @@ use std::pin::Pin;
 
 use super::gates::{should_autonomously_continue, GateCommandRunner, ShellGateRunner};
 use super::{
-    add_autonomous_continuation, add_autonomous_usage, autonomous_limit_reason, autonomous_status,
-    build_autonomous_gate_failure_continuation, now_millis, AgentAutonomousStatus,
-    AutonomousDecisionReason, AutonomousLimitReason, AutonomousRuntimeState,
+    add_autonomous_conversation_turn, add_autonomous_continuation, add_autonomous_usage,
+    autonomous_limit_reason, autonomous_status, build_autonomous_gate_failure_continuation,
+    note_autonomous_work, now_millis, AgentAutonomousStatus, AutonomousDecisionReason,
+    AutonomousLimitReason, AutonomousRuntimeState,
 };
 
 pub type AutonomousFollowUpFuture<'a> =
@@ -93,6 +94,15 @@ impl<R: GateCommandRunner> AutonomousDriver for ShellAutonomousDriver<R> {
     ) {
         if message.stop_reason != pa_types::ai::StopReason::Error {
             add_autonomous_usage(state, Some(&message.usage));
+            if message
+                .content
+                .iter()
+                .any(|block| {
+                    matches!(block, pa_types::ai::AssistantContentBlock::ToolCall(_))
+                })
+            {
+                note_autonomous_work(state);
+            }
         }
     }
 
@@ -109,6 +119,7 @@ impl<R: GateCommandRunner> AutonomousDriver for ShellAutonomousDriver<R> {
             {
                 return AutonomousFollowUp::Inactive;
             }
+            add_autonomous_conversation_turn(state);
             let decision =
                 should_autonomously_continue(state, Some(message.stop_reason), &self.gates).await;
             if decision.should_continue {
@@ -420,6 +431,30 @@ mod tests {
         }
     }
 
+    fn tool_message(stop_reason: StopReason, usage: Usage) -> AssistantMessage {
+        AssistantMessage {
+            content: vec![AssistantContentBlock::ToolCall(pa_types::ai::ToolCall {
+                id: "call-1".to_string(),
+                name: "python_repl".to_string(),
+                arguments: serde_json::Map::default(),
+                thought_signature: None,
+                rest: serde_json::Map::default(),
+            })],
+            api: "faux".to_string(),
+            provider: "faux".to_string(),
+            model: "faux-1".to_string(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage,
+            stop_reason,
+            stop_reason_raw: None,
+            error_message: None,
+            timestamp: 0,
+            rest: serde_json::Map::default(),
+        }
+    }
+
     #[tokio::test]
     async fn usage_accounting_per_message_skips_errors() {
         let config = enabled_config(Some(AgentAutonomousGateConfig {
@@ -429,13 +464,71 @@ mod tests {
         let mut state = create_autonomous_runtime_state(Some(&config), None);
         let driver = driver_with(vec![ok()]);
         driver.account_message(&mut state, &message(StopReason::Stop, usage(100, 40)));
-        assert_eq!(state.turns_used, 1);
+        // Tokens are per-message; conversation turns are counted at the
+        // driver consult, not per message.
+        assert_eq!(state.turns_used, 0);
         assert_eq!(state.tokens_used, 140);
         driver.account_message(&mut state, &message(StopReason::Error, usage(100, 40)));
-        assert_eq!(state.turns_used, 1);
-        // Aborted turns still count, like the settled message it was.
+        assert_eq!(state.tokens_used, 140);
+        // Aborted messages still spend tokens, like the settled message they were.
         driver.account_message(&mut state, &message(StopReason::Aborted, usage(10, 10)));
-        assert_eq!(state.turns_used, 2);
+        assert_eq!(state.tokens_used, 160);
+        assert_eq!(state.turns_used, 0);
+    }
+
+    #[tokio::test]
+    async fn tool_call_turns_reset_the_push_budget() {
+        let config = AgentAutonomousConfig {
+            enabled: Some(true),
+            max_continuations: Some(1),
+            ..Default::default()
+        };
+        let mut state = create_autonomous_runtime_state(Some(&config), None);
+        let driver = driver_with(vec![]);
+        // No-work pauses exhaust the push budget...
+        match after_turn(&driver, &mut state).await {
+            AutonomousFollowUp::Continue { .. } => {}
+            other => panic!("expected continuation, got {other:?}"),
+        }
+        match after_turn(&driver, &mut state).await {
+            AutonomousFollowUp::Stop { .. } => {}
+            other => panic!("expected stop, got {other:?}"),
+        }
+        // ...but a tool-call turn resets it: the next pause continues.
+        driver.account_message(&mut state, &tool_message(StopReason::ToolUse, usage(1, 1)));
+        assert_eq!(state.continuations_since_work, 0);
+        assert!(matches!(
+            after_turn(&driver, &mut state).await,
+            AutonomousFollowUp::Continue { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn lifetime_pushes_do_not_stop_work_following_pauses() {
+        // The cmatrix failure shape: pushes burned by early no-op turns must
+        // not stop a run that has since done tool work.
+        let config = AgentAutonomousConfig {
+            enabled: Some(true),
+            max_continuations: Some(3),
+            ..Default::default()
+        };
+        let mut state = create_autonomous_runtime_state(Some(&config), None);
+        let driver = driver_with(vec![]);
+        for _ in 0..3 {
+            assert!(matches!(
+                after_turn(&driver, &mut state).await,
+                AutonomousFollowUp::Continue { .. }
+            ));
+        }
+        assert_eq!(state.continuations_used, 3);
+        // Tool work, then a mid-work pause: the run continues.
+        driver.account_message(&mut state, &tool_message(StopReason::ToolUse, usage(1, 1)));
+        let follow_up = after_turn(&driver, &mut state).await;
+        let AutonomousFollowUp::Continue { text } = follow_up else {
+            panic!("a pause after tool work must continue");
+        };
+        assert!(text.contains("Budget: conversation turn 4 of"));
+        assert!(text.contains("pushes since your last tool work 1 of 3"));
     }
 
     /// A stop carries the reason and a status snapshot; the stop itself never writes a row.
