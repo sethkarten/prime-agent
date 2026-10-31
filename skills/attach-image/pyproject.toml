@@ -3,7 +3,10 @@ name = "prime-agent-skill-attach-image"
 version = "0.1.0"
 description = "Load on-disk images into the model's context as viewable attachments."
 requires-python = ">=3.10"
-dependencies = ["pillow>=10.0.0", "prime-agent-runtime"]
+# pillow 12.3+ ships no manylinux glibc-2.17 wheels, so a compiler-less
+# old-glibc host (the swe-sweep task images are Debian 9, glibc 2.24) falls
+# back to the sdist and dies with no cc. 12.2.0 is the last wheel line.
+dependencies = ["pillow>=10.0.0,<12.3", "prime-agent-runtime"]
 
 [project.scripts]
 attach_image = "rlm.skill:cli"
