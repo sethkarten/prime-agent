@@ -738,6 +738,33 @@ class ReplTest(unittest.TestCase):
             self.assertIn("bash('...')", error["evalue"], rid)
             self.assertEqual(one(events, "done")["status"], "error", rid)
 
+    def test_discipline_screen_points_pty_capture_at_tui_probe(self):
+        for rid, code in (
+            ("popen-pty", "import subprocess, pty, os\nm, s = pty.openpty()\np = subprocess.Popen(['./exe'], stdin=s, stdout=s)"),
+            ("pty-spawn", "import pty\npty.spawn('/bin/sh')"),
+            ("termios-runner", "import subprocess, termios\np = subprocess.Popen(['./exe'], stdin=termios)"),
+            ("capture-import", "import subprocess, pty\ndef capture(): pass"),
+        ):
+            events = self.repl.execute(rid, code)
+            error = one(events, "error")
+            self.assertEqual(error["ename"], "CellDeclinedError", rid)
+            self.assertIn("bash('...')", error["evalue"], rid)
+            self.assertIn("tui_probe", error["evalue"], rid)
+            self.assertEqual(one(events, "done")["status"], "error", rid)
+
+    def test_discipline_screen_pointer_only_for_terminal_shapes(self):
+        for rid, code in (
+            ("plain-run", "import subprocess\nsubprocess.run(['ls'])"),
+            ("plain-import", "import subprocess"),
+            ("plain-os-system", "import os\nos.system('ls')"),
+            ("sleep", "import time\ntime.sleep(30)"),
+        ):
+            events = self.repl.execute(rid, code)
+            error = one(events, "error")
+            self.assertEqual(error["ename"], "CellDeclinedError", rid)
+            self.assertNotIn("tui_probe", error["evalue"], rid)
+            self.assertEqual(one(events, "done")["status"], "error", rid)
+
     def test_discipline_screen_spares_mentions_bash_and_libraries(self):
         code = (
             "import os\n"

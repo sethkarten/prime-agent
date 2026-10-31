@@ -619,6 +619,41 @@ _SUBPROCESS_CALLS = (
     "getstatusoutput",
 )
 
+# A decline of a pty-capture-shaped cell carries the bundled-tool pointer: the
+# skill-adoption bracket (listing, then a static task-adjacent nudge) showed a
+# listed or named capability is invisible at build time - the moment the model
+# starts hand-rolling a pty runner is the moment the pointer can land.
+_TERMINAL_CAPTURE_MARKERS = (
+    "pty",
+    "termios",
+    "tiocswinsz",
+    "tiocsctty",
+    "openpty",
+    "winsize",
+    "vt100",
+    "xterm",
+    "escape sequence",
+)
+_TERMINAL_CAPTURE_POINTER = (
+    " For terminal-program capture, use the bundled tui_probe module instead "
+    "of building a runner: tui_probe.run() runs the program under a controlled "
+    "pty with fixed size/TERM and keystrokes and renders the escape stream to "
+    "screen grids, and tui_probe.equiv() byte-compares CLI output."
+)
+
+
+def _terminal_capture_pointer(code: str) -> str:
+    """The bundled-tool pointer when the declined cell looks like terminal capture.
+
+    Marker-based on the raw cell text: a cell that mentions pty/termios/window
+    sizing or terminal emulation is doing terminal capture even when the
+    declined call itself is a plain subprocess call.
+    """
+    lowered = code.lower()
+    if any(marker in lowered for marker in _TERMINAL_CAPTURE_MARKERS):
+        return _TERMINAL_CAPTURE_POINTER
+    return ""
+
 
 class CellDeclinedError(Exception):
     """The kernel refused to run a cell: a banned shape under the discipline
@@ -698,7 +733,7 @@ def _declined_reason(code: str) -> CellDeclinedError | None:
                 "the command with bash('...') instead: it returns immediately, "
                 "await it bounded or read the handle later, and the [bash-done] "
                 "notification delivers the result. Remove the subprocess call and "
-                "rerun the cell."
+                "rerun the cell." + _terminal_capture_pointer(code)
             )
     if subprocess_import is not None:
         return CellDeclinedError(
@@ -707,7 +742,7 @@ def _declined_reason(code: str) -> CellDeclinedError | None:
             "Run the command with bash('...') instead: it returns immediately, "
             "await it bounded or read the handle later, and the [bash-done] "
             "notification delivers the result. Remove the subprocess import and "
-            "rerun the cell."
+            "rerun the cell." + _terminal_capture_pointer(code)
         )
     return None
 
