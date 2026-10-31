@@ -514,7 +514,8 @@ fn core_layer_documents_the_real_tool_surface() {
 
 // Packaged-set parity (TS packages/coding-agent/skills)
 
-/// The packaged skill set at TS tip `f62dae4d0` (`packages/coding-agent/skills/`): 12 skills — the
+/// The packaged skill set at TS tip `f62dae4d0` (`packages/coding-agent/skills/`) plus the
+/// Rust-lane `swarm-chat` room skill: 13 skills — the
 /// generic `mcp` doc skill in, the per-service linear/notion pair out (TS removed theirs when the
 /// generic MCP surface landed).
 const TS_PACKAGED_SKILL_SET: &[&str] = &[
@@ -529,6 +530,7 @@ const TS_PACKAGED_SKILL_SET: &[&str] = &[
     "refine",
     "rlm-heartbeat",
     "skill-creator",
+    "swarm-chat",
     "websearch",
 ];
 
