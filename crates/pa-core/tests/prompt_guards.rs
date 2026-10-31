@@ -514,9 +514,10 @@ fn core_layer_documents_the_real_tool_surface() {
 
 // Packaged-set parity (TS packages/coding-agent/skills)
 
-/// The packaged skill set at TS tip `f62dae4d0` (`packages/coding-agent/skills/`): 12 skills — the
-/// generic `mcp` doc skill in, the per-service linear/notion pair out (TS removed theirs when the
-/// generic MCP surface landed).
+/// The packaged skill set at TS tip `f62dae4d0` (`packages/coding-agent/skills/`) plus the
+/// Rust-lane skills: the generic `mcp` doc skill is in, the per-service linear/notion pair out
+/// (TS removed theirs when the generic MCP surface landed), and the `tui-probe` capture toolkit
+/// is bundled for behavioral characterization of terminal programs.
 const TS_PACKAGED_SKILL_SET: &[&str] = &[
     "agent-message",
     "agent-observe",
@@ -529,6 +530,7 @@ const TS_PACKAGED_SKILL_SET: &[&str] = &[
     "refine",
     "rlm-heartbeat",
     "skill-creator",
+    "tui-probe",
     "websearch",
 ];
 
