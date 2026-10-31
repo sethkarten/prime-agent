@@ -46,8 +46,13 @@ pub const DEFAULT_RLM_EXTRA_PACKAGES: [(&str, &str, &str); 12] = [
     ("tomli", "tomli", "tomli"),
     ("python-dotenv", "dotenv", "dotenv (python-dotenv)"),
     ("pandas", "pandas", "pandas"),
-    ("numpy", "numpy", "numpy"),
-    ("scipy", "scipy", "scipy"),
+    // numpy 2.3+ and scipy 1.17+ ship no manylinux glibc-2.17 wheels, so a
+    // compiler-less old-glibc host (the pinned swe-sweep task images are
+    // Debian 9, glibc 2.24) falls back to their sdists and the default
+    // package install dies with no cc in the image. Cap both at their last
+    // glibc-2.17 wheel lines, verified installable as wheels on Debian 9.
+    ("numpy<2.3", "numpy", "numpy"),
+    ("scipy<1.17", "scipy", "scipy"),
     ("beautifulsoup4", "bs4", "bs4 (Beautiful Soup)"),
     ("lxml", "lxml", "lxml"),
     ("pydantic", "pydantic", "pydantic"),
