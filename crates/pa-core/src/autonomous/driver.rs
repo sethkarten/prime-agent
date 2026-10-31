@@ -109,6 +109,7 @@ impl<R: GateCommandRunner> AutonomousDriver for ShellAutonomousDriver<R> {
             {
                 return AutonomousFollowUp::Inactive;
             }
+            let now = now_millis();
             let decision =
                 should_autonomously_continue(state, Some(message.stop_reason), &self.gates).await;
             if decision.should_continue {
@@ -121,10 +122,13 @@ impl<R: GateCommandRunner> AutonomousDriver for ShellAutonomousDriver<R> {
                                 build_autonomous_gate_failure_continuation(
                                     failure,
                                     state.gates.max_retries,
-                                    now_millis(),
+                                    now,
                                 )
                             },
                         )
+                    }
+                    _ if super::autonomous_budget_thin(state, now) => {
+                        super::build_autonomous_last_call_text(state, now)
                     }
                     _ => super::autonomous_continuation_text(state),
                 };
@@ -140,13 +144,28 @@ impl<R: GateCommandRunner> AutonomousDriver for ShellAutonomousDriver<R> {
                     }
                 }
                 AutonomousDecisionReason::LimitReached => {
-                    let reason = autonomous_limit_reason(state, now_millis()).map_or(
-                        AutonomousStopReason::GateRetryExhausted,
-                        AutonomousStopReason::Limit,
-                    );
-                    AutonomousFollowUp::Stop {
-                        reason,
-                        status: Box::new(autonomous_status(state)),
+                    // The exhausted budget mints one finalize wake before the
+                    // stop: the model gets a final turn to write its
+                    // deliverable and run the task's submission step.
+                    if let Some(reason) = autonomous_limit_reason(state, now) {
+                        if !state.finalize_wake_used {
+                            state.finalize_wake_used = true;
+                            let status = autonomous_status(state);
+                            return AutonomousFollowUp::Continue {
+                                text: super::build_autonomous_finalize_wake_text(
+                                    &status, reason, now,
+                                ),
+                            };
+                        }
+                        AutonomousFollowUp::Stop {
+                            reason: AutonomousStopReason::Limit(reason),
+                            status: Box::new(autonomous_status(state)),
+                        }
+                    } else {
+                        AutonomousFollowUp::Stop {
+                            reason: AutonomousStopReason::GateRetryExhausted,
+                            status: Box::new(autonomous_status(state)),
+                        }
                     }
                 }
                 reason => {
@@ -270,7 +289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn limit_hit_stops_with_reason_and_status() {
+    async fn limit_hit_mints_last_call_wake_then_stops_with_reason_and_status() {
         let config = AgentAutonomousConfig {
             enabled: Some(true),
             max_continuations: Some(1),
@@ -278,15 +297,37 @@ mod tests {
         };
         let mut state = create_autonomous_runtime_state(Some(&config), None);
         let driver = driver_with(vec![]);
-        // First turn: no limit yet -> continue (consumes the only
-        // continuation slot).
+        // First turn: no limit yet -> the only continuation carries the
+        // last-call text (the turn it drives may be the model's last).
         match after_turn(&driver, &mut state).await {
             AutonomousFollowUp::Continue { text } => {
-                assert!(text.starts_with("[autonomous-continuation]\n\n"));
+                assert!(
+                    text.starts_with("[autonomous-continuation: last-call]"),
+                    "{text}"
+                );
+                assert!(text.contains("continuations 1/1"), "{text}");
             }
-            other => panic!("expected continuation, got {other:?}"),
+            other => panic!("expected last-call continuation, got {other:?}"),
         }
         assert_eq!(state.continuations_used, 1);
+        // Second turn: the spent budget mints its one finalize wake before the stop.
+        match after_turn(&driver, &mut state).await {
+            AutonomousFollowUp::Continue { text } => {
+                assert!(
+                    text.starts_with("[autonomous-continuation: finalize-wake]"),
+                    "{text}"
+                );
+                assert!(text.contains("maxContinuations reached (1/1)"), "{text}");
+                assert!(text.contains("This is your FINAL turn"), "{text}");
+            }
+            other => panic!("expected the finalize wake, got {other:?}"),
+        }
+        assert_eq!(
+            state.continuations_used, 1,
+            "the wake spends no continuation"
+        );
+        assert!(state.finalize_wake_used);
+        // The wake's turn settles: the same limit stops the run.
         match after_turn(&driver, &mut state).await {
             AutonomousFollowUp::Stop { reason, status } => {
                 assert_eq!(
