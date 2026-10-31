@@ -7,9 +7,10 @@ use std::pin::Pin;
 
 use super::gates::{should_autonomously_continue, GateCommandRunner, ShellGateRunner};
 use super::{
-    add_autonomous_continuation, add_autonomous_usage, autonomous_limit_reason, autonomous_status,
-    build_autonomous_gate_failure_continuation, now_millis, AgentAutonomousStatus,
-    AutonomousDecisionReason, AutonomousLimitReason, AutonomousRuntimeState,
+    add_autonomous_continuation, add_autonomous_tool_calls, add_autonomous_usage,
+    assistant_tool_call_count, autonomous_limit_reason, autonomous_status,
+    build_autonomous_gate_failure_continuation, no_tool_continuation, now_millis,
+    AgentAutonomousStatus, AutonomousDecisionReason, AutonomousLimitReason, AutonomousRuntimeState,
 };
 
 pub type AutonomousFollowUpFuture<'a> =
@@ -94,6 +95,7 @@ impl<R: GateCommandRunner> AutonomousDriver for ShellAutonomousDriver<R> {
         if message.stop_reason != pa_types::ai::StopReason::Error {
             add_autonomous_usage(state, Some(&message.usage));
         }
+        add_autonomous_tool_calls(state, assistant_tool_call_count(message));
     }
 
     fn after_turn<'a>(
@@ -103,6 +105,9 @@ impl<R: GateCommandRunner> AutonomousDriver for ShellAutonomousDriver<R> {
     ) -> AutonomousFollowUpFuture<'a> {
         Box::pin(async move {
             use pa_types::ai::StopReason;
+            // The turn is settled: its accumulated tool-call count is the
+            // no-op detection input; the next turn starts from zero.
+            let turn_tool_calls = std::mem::take(&mut state.turn_tool_calls);
             if !state.enabled
                 || message.stop_reason == StopReason::Error
                 || message.stop_reason == StopReason::Aborted
@@ -113,7 +118,7 @@ impl<R: GateCommandRunner> AutonomousDriver for ShellAutonomousDriver<R> {
                 should_autonomously_continue(state, Some(message.stop_reason), &self.gates).await;
             if decision.should_continue {
                 add_autonomous_continuation(state);
-                let text = match decision.reason {
+                let base = match decision.reason {
                     AutonomousDecisionReason::GateFailed => {
                         state.last_gate_failure.as_ref().map_or_else(
                             || super::autonomous_continuation_text(state),
@@ -127,6 +132,17 @@ impl<R: GateCommandRunner> AutonomousDriver for ShellAutonomousDriver<R> {
                         )
                     }
                     _ => super::autonomous_continuation_text(state),
+                };
+                // A turn that settled without a single tool call executed
+                // nothing: escalate the streak and harden the reprompt so
+                // the same text-only reply is not accepted again. A turn
+                // that acted clears the streak.
+                let text = if turn_tool_calls == 0 {
+                    no_tool_continuation(state, message, base)
+                } else {
+                    state.no_tool_streak = 0;
+                    state.last_no_tool_text = None;
+                    base
                 };
                 return AutonomousFollowUp::Continue { text };
             }
@@ -167,7 +183,9 @@ mod tests {
         create_autonomous_runtime_state, AgentAutonomousConfig, AgentAutonomousGateConfig,
         GitWorktreeSnapshot,
     };
-    use pa_types::ai::{AssistantContentBlock, AssistantMessage, StopReason, TextContent, Usage};
+    use pa_types::ai::{
+        AssistantContentBlock, AssistantMessage, StopReason, TextContent, ToolCall, Usage,
+    };
     use std::pin::pin;
 
     fn message(stop_reason: StopReason, usage: Usage) -> AssistantMessage {
@@ -269,6 +287,15 @@ mod tests {
         future.await
     }
 
+    async fn after_turn_with<R: GateCommandRunner>(
+        driver: &ShellAutonomousDriver<R>,
+        state: &mut AutonomousRuntimeState,
+        message: &AssistantMessage,
+    ) -> AutonomousFollowUp {
+        let future = pin!(driver.after_turn(state, message));
+        future.await
+    }
+
     #[tokio::test]
     async fn limit_hit_stops_with_reason_and_status() {
         let config = AgentAutonomousConfig {
@@ -298,6 +325,98 @@ mod tests {
             }
             other => panic!("expected stop, got {other:?}"),
         }
+    }
+
+    fn text_message(text: &str) -> AssistantMessage {
+        let mut message = message(StopReason::Stop, usage(10, 5));
+        let Some(AssistantContentBlock::Text(content)) = message.content.first_mut() else {
+            unreachable!("the fixture message is text-only");
+        };
+        content.text = text.to_string();
+        message
+    }
+
+    fn tool_message(text: &str) -> AssistantMessage {
+        let mut message = text_message(text);
+        message
+            .content
+            .push(AssistantContentBlock::ToolCall(ToolCall {
+                id: "call-1".to_string(),
+                name: "python_repl".to_string(),
+                arguments: serde_json::Map::default(),
+                thought_signature: None,
+                rest: serde_json::Map::default(),
+            }));
+        message
+    }
+
+    #[tokio::test]
+    async fn no_tool_turns_escalate_and_reject_repeats() {
+        let config = AgentAutonomousConfig {
+            enabled: Some(true),
+            max_continuations: Some(10),
+            max_turns: Some(10),
+            ..Default::default()
+        };
+        let mut state = create_autonomous_runtime_state(Some(&config), None);
+        let driver = driver_with(vec![]);
+
+        // First text-only turn: the continuation demands a tool call.
+        let message = text_message("I'll start by exploring the workspace.");
+        match after_turn_with(&driver, &mut state, &message).await {
+            AutonomousFollowUp::Continue { text } => {
+                assert!(text.starts_with(
+                    "[autonomous-continuation]
+
+"
+                ));
+                assert!(text.contains("no tool call was made"));
+                assert!(text.contains("must include at least one real tool call"));
+                assert!(!text.contains("repeated the same text"));
+            }
+            other => panic!("expected continuation, got {other:?}"),
+        }
+        assert_eq!(state.no_tool_streak, 1);
+
+        // The identical text again: level 2, the repeat named.
+        match after_turn_with(&driver, &mut state, &message).await {
+            AutonomousFollowUp::Continue { text } => {
+                assert!(text.contains("2nd consecutive turn"));
+                assert!(text.contains("repeated the same text"));
+            }
+            other => panic!("expected continuation, got {other:?}"),
+        }
+        assert_eq!(state.no_tool_streak, 2);
+
+        // Different text, still no tool call: level 3 without the repeat.
+        let message = text_message("Let me check the task files instead.");
+        match after_turn_with(&driver, &mut state, &message).await {
+            AutonomousFollowUp::Continue { text } => {
+                assert!(text.contains("3rd consecutive text-only turn"));
+                assert!(!text.contains("repeated the same text"));
+            }
+            other => panic!("expected continuation, got {other:?}"),
+        }
+        assert_eq!(state.no_tool_streak, 3);
+
+        // A productive turn (a tool call accounted) clears the streak and
+        // the continuation returns to the plain contract.
+        let message = tool_message("I inspected the workspace.");
+        driver.account_message(&mut state, &message);
+        match after_turn_with(&driver, &mut state, &message).await {
+            AutonomousFollowUp::Continue { text } => {
+                assert!(text.starts_with(
+                    "[autonomous-continuation]
+
+"
+                ));
+                assert!(!text.contains("no tool call was made"));
+            }
+            other => panic!("expected continuation, got {other:?}"),
+        }
+        assert_eq!(state.no_tool_streak, 0);
+        assert_eq!(state.last_no_tool_text, None);
+        assert_eq!(state.turn_tool_calls, 0);
     }
 
     #[tokio::test]

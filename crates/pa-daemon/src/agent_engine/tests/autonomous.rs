@@ -34,11 +34,17 @@ fn autonomous_limit_stops_the_run_without_a_row() {
     // 2 hits the cap; the stop writes no row.
     assert_eq!(assistant_texts(&events), vec!["first", "second"]);
     let texts = user_texts(&events);
+    // The faux turn is text-only: the continuation carries the run contract
+    // plus the level-1 no-tool demand.
     assert_eq!(
         texts,
         vec![
             "go".to_string(),
-            "[autonomous-continuation]\n\nNo human input is available in autonomous mode. Continue working until the host evaluator, verifier, or configured autonomous limits stop the run. If you were asking the user a question, make a reasonable assumption and verify it. If you believe you are blocked, prove it with host-observable evidence, preserve that evidence, and keep looking for safe progress while budget remains. Do not end the session yourself; the verifier/evaluator decides completion when configured gates pass.".to_string()
+            format!(
+                "[autonomous-continuation]\n\n{}\n\n{}",
+                "No human input is available in autonomous mode. Continue working until the host evaluator, verifier, or configured autonomous limits stop the run. If you were asking the user a question, make a reasonable assumption and verify it. If you believe you are blocked, prove it with host-observable evidence, preserve that evidence, and keep looking for safe progress while budget remains. Do not end the session yourself; the verifier/evaluator decides completion when configured gates pass.",
+                "Your previous turn ended with text only: no tool call was made, so nothing was inspected, run, or written. Your next reply must include at least one real tool call (for example `python_repl` or `bash`) that does concrete work on the task. Do not answer with text only again."
+            )
         ]
     );
     // One `turn_start` frame between the settled `turn_end` and the continuation user row.

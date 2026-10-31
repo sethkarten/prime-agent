@@ -120,6 +120,15 @@ pub struct AutonomousRuntimeState {
     pub last_gate_failure: Option<AgentAutonomousGateFailure>,
     pub last_gate_failure_snapshot: Option<GitWorktreeSnapshot>,
     pub subagent_keep_alive_ms: u64,
+    /// Tool calls settled in the turn in progress; the follow-up consult takes
+    /// the count when the turn settles.
+    pub turn_tool_calls: u64,
+    /// Consecutive settled turns that made no tool call: text-only turns
+    /// where no work was executed.
+    pub no_tool_streak: u64,
+    /// The normalized final text of the last no-tool turn, for repeat
+    /// detection across consecutive text-only turns.
+    pub last_no_tool_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +216,9 @@ pub fn create_autonomous_runtime_state(
             last_gate_failure: None,
             last_gate_failure_snapshot: None,
             subagent_keep_alive_ms: normalize_subagent_keep_alive_ms(None),
+            turn_tool_calls: 0,
+            no_tool_streak: 0,
+            last_no_tool_text: None,
         };
     };
     AutonomousRuntimeState {
@@ -259,6 +271,9 @@ pub fn create_autonomous_runtime_state(
         last_gate_failure: None,
         last_gate_failure_snapshot: None,
         subagent_keep_alive_ms: normalize_subagent_keep_alive_ms(config.subagent_keep_alive_ms),
+        turn_tool_calls: 0,
+        no_tool_streak: 0,
+        last_no_tool_text: None,
     }
 }
 
@@ -272,6 +287,9 @@ pub fn set_autonomous_enabled(state: &mut AutonomousRuntimeState, enabled: bool)
         state.continuations_used = 0;
         state.turns_used = 0;
         state.tokens_used = 0;
+        state.turn_tool_calls = 0;
+        state.no_tool_streak = 0;
+        state.last_no_tool_text = None;
         state.started_at = Some(now_millis());
     } else {
         state.started_at = None;
@@ -336,6 +354,106 @@ pub fn add_autonomous_continuation(state: &mut AutonomousRuntimeState) {
         return;
     }
     state.continuations_used += 1;
+}
+
+/// Account one settled assistant message's tool calls into the turn in
+/// progress; the follow-up consult takes the count when the turn settles.
+pub fn add_autonomous_tool_calls(state: &mut AutonomousRuntimeState, count: u64) {
+    if !state.enabled {
+        return;
+    }
+    state.turn_tool_calls += count;
+}
+
+/// How many tool calls one assistant message carries.
+#[must_use]
+pub fn assistant_tool_call_count(message: &pa_types::ai::AssistantMessage) -> u64 {
+    message
+        .content
+        .iter()
+        .filter(|block| matches!(block, pa_types::ai::AssistantContentBlock::ToolCall(_)))
+        .count() as u64
+}
+
+/// Characters of a settled turn's text kept for repeat comparison.
+const MAX_NO_TOOL_TEXT_CHARS: usize = 2_000;
+
+/// The settled turn made no tool call: count the streak, detect a repeated
+/// text-only reply, and harden the continuation the reprompt carries. The
+/// same words without a tool call must not be accepted as progress twice.
+#[must_use]
+pub fn no_tool_continuation(
+    state: &mut AutonomousRuntimeState,
+    message: &pa_types::ai::AssistantMessage,
+    base: String,
+) -> String {
+    let streak = state.no_tool_streak + 1;
+    let text = normalized_turn_text(message);
+    let repeated = state.last_no_tool_text.as_deref() == Some(text.as_str());
+    state.no_tool_streak = streak;
+    state.last_no_tool_text = Some(text);
+    build_no_tool_continuation(base, streak, repeated)
+}
+
+/// The escalating demand appended to a no-tool turn's base continuation:
+/// the run contract stays legible first, the demand follows, and its
+/// severity grows with each consecutive text-only turn.
+#[must_use]
+pub fn build_no_tool_continuation(base: String, streak: u64, repeated: bool) -> String {
+    let mut text = base;
+    text.push_str("\n\n");
+    text.push_str(&no_tool_demand(streak, repeated));
+    text
+}
+
+fn no_tool_demand(streak: u64, repeated: bool) -> String {
+    let repeat_clause = if repeated {
+        " Your last reply repeated the same text as the turn before; an identical reply is not progress and will not be accepted as work."
+    } else {
+        ""
+    };
+    match streak {
+        1 => format!(
+            "Your previous turn ended with text only: no tool call was made, so nothing was inspected, run, or written. Your next reply must include at least one real tool call (for example `python_repl` or `bash`) that does concrete work on the task. Do not answer with text only again.{repeat_clause}"
+        ),
+        2 => format!(
+            "This is the 2nd consecutive turn that ended with text only and no tool call. Describing what you will do is not progress; only tool calls advance the task. Make a tool call now: read the task files, run a command, or inspect the workspace. A text-only reply will be recorded as another wasted turn.{repeat_clause}"
+        ),
+        3 => format!(
+            "This is the 3rd consecutive text-only turn with no tool call; the run is spending its budget without acting. Your next message must contain a tool call. If you do not know where to start, use one tool call to list and read the task's files.{repeat_clause}"
+        ),
+        streak => format!(
+            "This is now {streak} consecutive text-only turns with no tool call: nothing has been executed for {streak} turns. Answer only with tool calls from now on, starting with one tool call that inspects the task, and keep working through tools until the task is complete.{repeat_clause}"
+        ),
+    }
+}
+
+/// The settled turn's text, normalized for exact repeat comparison:
+/// case-folded, whitespace-collapsed, capped.
+fn normalized_turn_text(message: &pa_types::ai::AssistantMessage) -> String {
+    let joined = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            pa_types::ai::AssistantContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut normalized = String::new();
+    let mut pending_space = false;
+    for character in joined.trim().chars() {
+        if character.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        pending_space = false;
+        normalized.extend(character.to_lowercase());
+    }
+    normalized.chars().take(MAX_NO_TOOL_TEXT_CHARS).collect()
 }
 
 /// Cache-read tokens are repeated context served from the provider cache;
@@ -650,6 +768,79 @@ mod tests {
             .contains("at least 1 minute without"));
         assert!(create_autonomous_subagent_keep_alive_text(&state)
             .contains("at least 25 minutes without"));
+    }
+
+    #[test]
+    fn no_tool_demands_escalate_with_the_streak() {
+        let base = "[autonomous-continuation]\n\nBase contract.".to_string();
+        let level_1 = build_no_tool_continuation(base.clone(), 1, false);
+        assert!(
+            level_1.starts_with("[autonomous-continuation]\n\nBase contract.\n\n"),
+            "{level_1}"
+        );
+        assert!(level_1.contains("no tool call was made"));
+        assert!(level_1.contains("must include at least one real tool call"));
+        assert!(!level_1.contains("repeated the same text"));
+        let level_2 = build_no_tool_continuation(base.clone(), 2, true);
+        assert!(level_2.contains("2nd consecutive turn"));
+        assert!(level_2.contains("repeated the same text"));
+        let level_3 = build_no_tool_continuation(base.clone(), 3, false);
+        assert!(level_3.contains("3rd consecutive text-only turn"));
+        let level_5 = build_no_tool_continuation(base, 5, true);
+        assert!(level_5.contains("This is now 5 consecutive text-only turns"));
+        assert!(level_5.contains("repeated the same text"));
+    }
+
+    #[test]
+    fn repeated_turn_text_survives_normalization() {
+        fn message(text: &str) -> pa_types::ai::AssistantMessage {
+            pa_types::ai::AssistantMessage {
+                content: vec![pa_types::ai::AssistantContentBlock::Text(
+                    pa_types::ai::TextContent {
+                        text: text.to_string(),
+                        text_signature: None,
+                        rest: serde_json::Map::default(),
+                    },
+                )],
+                api: "faux".to_string(),
+                provider: "faux".to_string(),
+                model: "faux-1".to_string(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: pa_types::ai::Usage::default(),
+                stop_reason: pa_types::ai::StopReason::Stop,
+                stop_reason_raw: None,
+                error_message: None,
+                timestamp: 0,
+                rest: serde_json::Map::default(),
+            }
+        }
+        assert_eq!(
+            normalized_turn_text(&message(
+                "I'll start by exploring the  workspace.\n\nLet me begin."
+            )),
+            normalized_turn_text(&message(
+                "i'll start by exploring the workspace.\nlet me begin."
+            ),)
+        );
+        let mut state = create_autonomous_runtime_state(Some(&config(true)), None);
+        let base = autonomous_continuation_text(&state);
+        let first = no_tool_continuation(&mut state, &message("I'll explore"), base.clone());
+        assert_eq!(state.no_tool_streak, 1);
+        assert!(first.contains("Do not answer with text only again."));
+        let repeated = no_tool_continuation(&mut state, &message("I'll explore"), base);
+        assert_eq!(state.no_tool_streak, 2);
+        assert!(repeated.contains("repeated the same text"));
+        // A productive turn resets the streak: the helper is only called for
+        // no-tool turns by the driver, but the state reset is part of the
+        // flow it documents.
+        state.no_tool_streak = 0;
+        state.last_no_tool_text = None;
+        let base = autonomous_continuation_text(&state);
+        let fresh = no_tool_continuation(&mut state, &message("different words"), base);
+        assert!(fresh.contains("no tool call was made"));
+        assert!(!fresh.contains("repeated the same text"));
     }
 
     #[test]
