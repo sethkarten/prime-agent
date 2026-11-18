@@ -217,13 +217,15 @@ async fn a_turn_held_notice_queues_on_a_busy_session_and_stays_quiet_when_idle()
 }
 
 /// A waiting keepalive notice queues on the steering lane like a completion,
-/// with its [waiting] content and the capped-pid row.
+/// with its [waiting] content and the capped-pid row — and the parked gate,
+/// which runs inside the admission's own lock section, refuses it once the
+/// delivery is busy or compacting so no visible row can cut the turn.
 #[tokio::test]
 async fn a_bash_waiting_notice_queues_on_the_steering_lane() {
     let worker = created_worker_with_journal().await;
     worker.dispatch("clear_queue", &json!({})).await;
     let notify = Arc::new(Notify::new());
-    admit_kernel_notice(
+    admit_parked_notice(
         &worker.recovery,
         &worker.core,
         &notify,
@@ -252,10 +254,44 @@ async fn a_bash_waiting_notice_queues_on_the_steering_lane() {
     );
     // An idle session's wake is an invisible injected turn.
     assert!(!item.queue_visible, "the idle wake stays invisible");
+    assert_eq!(item.policy, TurnPolicy::Injected);
     drop(core);
     assert!(
         WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
         "the keepalive admission is live work"
+    );
+    // The parked gate: a busy delivery refuses the keepalive in the same
+    // lock section as the push, so its turn is never cut.
+    worker.core.lock().unwrap().busy = true;
+    admit_parked_notice(
+        &worker.recovery,
+        &worker.core,
+        &notify,
+        crate::engine::KernelNotice::bash_waiting(&[7229], &["heavy.py gamma".to_string()], 1),
+        || false,
+    );
+    assert_eq!(
+        worker.core.lock().unwrap().steering.len(),
+        1,
+        "the busy session refuses the waiting notice"
+    );
+    // A compacting session refuses it too.
+    {
+        let mut core = worker.core.lock().unwrap();
+        core.busy = false;
+        core.compacting = true;
+    }
+    admit_parked_notice(
+        &worker.recovery,
+        &worker.core,
+        &notify,
+        crate::engine::KernelNotice::bash_waiting(&[7230], &["heavy.py delta".to_string()], 1),
+        || false,
+    );
+    assert_eq!(
+        worker.core.lock().unwrap().steering.len(),
+        1,
+        "the compacting session refuses the waiting notice"
     );
     let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
 }

@@ -25,10 +25,10 @@ mod queue;
 pub use queue::Lane;
 pub use queue::QueuePriority;
 pub(crate) use queue::{
-    admit_autonomous_follow_up, admit_goal_follow_up, admit_kernel_notice, admit_turn_held_notice,
-    checkpoint_queue_recovery, clear_withdrawn_progress_note, enqueue_priority,
-    gather_delivery_batch, parse_custom_message, parse_prompt_images, queue_lanes,
-    queued_bash_completion_notices, restore_queue_snapshot, restored_turn_policy,
+    admit_autonomous_follow_up, admit_goal_follow_up, admit_kernel_notice, admit_parked_notice,
+    admit_turn_held_notice, checkpoint_queue_recovery, clear_withdrawn_progress_note,
+    enqueue_priority, gather_delivery_batch, parse_custom_message, parse_prompt_images,
+    queue_lanes, queued_bash_completion_notices, restore_queue_snapshot, restored_turn_policy,
     withdraw_bash_completion_notice, QueueCheckpoint, QueueLanes, QueuedItem, TurnPolicy,
     TurnSettle, ABORTED_TURN_SETTLE_ERROR, PROMPT_ABORTED_BEFORE_DELIVERY, QUEUED_INPUT_SUSPENDED,
     QUEUED_PROMPT_DELETED, SIDE_QUESTION_SETTLE_TIMEOUT,
@@ -641,17 +641,21 @@ impl Worker {
                     // A [waiting] keepalive is only for the parked session: a
                     // busy session's own turn keeps its clocks warm, and a
                     // queued waiting row would only add boundary noise. The
-                    // kernel skips in-flight ticks too; this closes the race.
+                    // parked gate runs inside the admission's own lock
+                    // section, so a delivery that turns busy in the window
+                    // between the sample and the push is refused instead of
+                    // cutting the turn.
                     if notice.row.custom_type
                         == pa_core::session_engine::messages::BASH_WAITING_NOTICE_CUSTOM_TYPE
                     {
-                        let busy = {
-                            let core = notice_core.lock().unwrap();
-                            core.busy || core.compacting
-                        };
-                        if busy {
-                            return;
-                        }
+                        admit_parked_notice(
+                            &notice_recovery,
+                            &notice_core,
+                            &notice_notify,
+                            notice,
+                            || engine.session_is_closed(),
+                        );
+                        return;
                     }
                     admit_kernel_notice(
                         &notice_recovery,
